@@ -1,0 +1,75 @@
+
+name: Build Bard's Score
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  MOMENTUM_REF: d3f89dfe
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Bard's Score
+        uses: actions/checkout@v4
+        with:
+          path: bards-score
+
+      - name: Checkout Momentum firmware
+        uses: actions/checkout@v4
+        with:
+          repository: Next-Flip/Momentum-Firmware
+          ref: dev
+          submodules: recursive
+          fetch-depth: 0
+          path: momentum
+
+      - name: Select exact Momentum revision
+        working-directory: momentum
+        run: |
+          git checkout ${{ env.MOMENTUM_REF }}
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git python3 python3-pip \
+            gcc-arm-none-eabi binutils-arm-none-eabi
+
+      - name: Copy Bard's Score into Momentum
+        run: |
+          mkdir -p momentum/applications_user/bards_score
+          cp bards-score/bards_score.c \
+            momentum/applications_user/bards_score/
+          cp bards-score/application.fam \
+            momentum/applications_user/bards_score/
+
+      - name: Build Bard's Score FAP
+        working-directory: momentum
+        run: |
+          ./fbt fap_bards_score
+
+      - name: Locate compiled FAP
+        run: |
+          find momentum/build -type f \
+            -name '*.fap' -print
+          FAP=$(find momentum/build -type f \
+            -name 'bards_score.fap' -print -quit)
+          test -n "$FAP"
+          mkdir -p output
+          cp "$FAP" output/
+
+      - name: Upload Bard's Score
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bards-Score-Momentum
+          path: output/bards_score.fap
+          if-no-files-found: error
+          
