@@ -1,0 +1,11 @@
+App(
+    appid="bards_score",
+    name="Bard's Score",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="bards_score_app",
+    requires=["gui", "storage"],
+    stack_size=4096,
+    fap_category="Music",
+    fap_description="Monophonic treble-clef melody editor",
+    fap_author="Bard",
+)
