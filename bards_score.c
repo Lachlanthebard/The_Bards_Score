@@ -1,4 +1,5 @@
 #include <furi.h>
+#include <furi_hal_speaker.h>
 #include <gui/gui.h>
 #include <gui/view_port.h>
 #include <input/input.h>
@@ -13,7 +14,7 @@
 #define XML_FILE SCORE_DIR "/melody.musicxml"
 #define STAFF_BOTTOM 47
 #define STAFF_SPACING 7
-#define MENU_COUNT 13
+#define MENU_COUNT 17
 
 typedef struct {
     uint8_t pitch;
@@ -31,27 +32,46 @@ typedef enum {
     ScreenPitch,
     ScreenDuration,
     ScreenMenu,
-    ScreenTime
+    ScreenTime,
+    ScreenTempo
 } Screen;
 
 typedef struct {
     FuriMutex* mutex;
     FuriMessageQueue* queue;
     ViewPort* viewport;
+
     Note notes[MAX_NOTES];
+
     uint16_t count;
     uint16_t selected;
+
     uint8_t pitch;
     uint8_t duration;
     uint8_t menu;
     uint8_t menu_top;
+
     uint8_t beats;
     uint8_t beat_type;
     uint8_t time_choice;
+
     bool adding_rest;
     Screen screen;
     bool running;
+
     char notice[22];
+
+    uint16_t tempo;
+
+    bool playing;
+    bool speaker_owned;
+    bool sounding;
+
+    uint16_t play_index;
+    uint16_t play_end;
+
+    uint32_t note_end_tick;
+    uint32_t sound_end_tick;
 } AppState;
 
 static const char* const durations[] = {
@@ -85,11 +105,20 @@ static const char* const menu_items[MENU_COUNT] = {
     "Save score",
     "Load score",
     "Export XML",
-    "Clear score"
+    "Clear score",
+    "Play score",
+    "Play from here",
+    "Preview note",
+    "Set tempo"
 };
 
-static const uint8_t time_beats[] = {2, 3, 4, 6};
-static const uint8_t time_denoms[] = {4, 4, 4, 8};
+static const uint8_t time_beats[] = {
+    2, 3, 4, 6
+};
+
+static const uint8_t time_denoms[] = {
+    4, 4, 4, 8
+};
 
 static uint8_t duration_ticks(uint8_t duration) {
     return (uint8_t)(16U >> duration);
@@ -136,7 +165,8 @@ static int note_y(uint8_t midi) {
 
 static void draw_staff(Canvas* canvas) {
     for(int i = 0; i < 5; ++i) {
-        int y = STAFF_BOTTOM - i * STAFF_SPACING;
+        int y =
+            STAFF_BOTTOM - i * STAFF_SPACING;
 
         canvas_draw_line(
             canvas, 2, y, 125, y);
@@ -150,28 +180,44 @@ static void draw_staff(Canvas* canvas) {
     canvas_draw_line(canvas, 12, 49, 9, 53);
 }
 
+/*
+ * RESTS
+ *
+ * Whole rest hangs below fourth line.
+ * Half rest sits above middle line.
+ *
+ * Half-rest correction retained.
+ */
+
 static void draw_rest(
     Canvas* canvas,
     int x,
     uint8_t duration) {
 
     if(duration <= 1) {
-        int y = duration == 0 ? 26 : 33;
+
+        int y =
+            duration == 0 ? 26 : 30;
 
         canvas_draw_box(
             canvas, x - 4, y, 8, 3);
 
     } else if(duration == 2) {
-        canvas_draw_line(
-            canvas, x + 1, 24, x - 2, 34);
 
         canvas_draw_line(
-            canvas, x - 2, 34, x + 3, 38);
+            canvas, x + 1, 24,
+            x - 2, 34);
 
         canvas_draw_line(
-            canvas, x + 3, 38, x - 2, 43);
+            canvas, x - 2, 34,
+            x + 3, 38);
+
+        canvas_draw_line(
+            canvas, x + 3, 38,
+            x - 2, 43);
 
     } else {
+
         canvas_draw_line(
             canvas, x, 23, x, 40);
 
@@ -242,19 +288,23 @@ static void draw_note(
         pc == 10) {
 
         canvas_draw_line(
-            canvas, x - 8, y - 5,
+            canvas,
+            x - 8, y - 5,
             x - 8, y + 5);
 
         canvas_draw_line(
-            canvas, x - 5, y - 5,
+            canvas,
+            x - 5, y - 5,
             x - 5, y + 5);
 
         canvas_draw_line(
-            canvas, x - 10, y - 2,
+            canvas,
+            x - 10, y - 2,
             x - 3, y - 3);
 
         canvas_draw_line(
-            canvas, x - 10, y + 2,
+            canvas,
+            x - 10, y + 2,
             x - 3, y + 1);
     }
 
@@ -267,15 +317,20 @@ static void draw_note(
     }
 
     if(note.duration != 0) {
+
         bool down = step >= 4;
 
-        int sx = down ? x - 3 : x + 3;
-        int end = y + (down ? 17 : -17);
+        int sx =
+            down ? x - 3 : x + 3;
+
+        int end =
+            y + (down ? 17 : -17);
 
         canvas_draw_line(
             canvas, sx, y, sx, end);
 
         if(note.duration >= 3) {
+
             int d = down ? -1 : 1;
 
             canvas_draw_line(
@@ -289,6 +344,7 @@ static void draw_note(
                 sx + 3, end + d * 9);
 
             if(note.duration == 4) {
+
                 canvas_draw_line(
                     canvas,
                     sx, end - d * 5,
@@ -311,6 +367,7 @@ static void draw_note(
     }
 
     if(note.accent) {
+
         canvas_draw_line(
             canvas,
             x - 4, y - 9,
@@ -323,6 +380,7 @@ static void draw_note(
     }
 
     if(note.fermata) {
+
         canvas_draw_circle(
             canvas, x, y - 13, 4);
 
@@ -346,6 +404,7 @@ static uint8_t tick_before(
     uint8_t used = 0;
 
     for(uint16_t i = 0; i < index; ++i) {
+
         uint8_t ticks =
             duration_ticks(
                 a->notes[i].duration);
@@ -378,6 +437,7 @@ static void draw_callback(
     canvas_set_font(canvas, FontPrimary);
 
     if(a->screen == ScreenScore) {
+
         canvas_draw_str(
             canvas, 2, 10, "Bard's Score");
 
@@ -410,6 +470,7 @@ static void draw_callback(
                     a->notes[i].duration);
 
             if(used && used + ticks > cap) {
+
                 canvas_draw_line(
                     canvas,
                     x - 9, 19,
@@ -467,6 +528,7 @@ static void draw_callback(
             }
 
             previous_x = x;
+
             previous_y =
                 note_y(a->notes[i].pitch);
 
@@ -474,6 +536,7 @@ static void draw_callback(
             used += ticks;
 
             if(used >= cap) {
+
                 if(
                     i + 1 < a->count &&
                     i + 1 < start + 6) {
@@ -493,7 +556,17 @@ static void draw_callback(
 
         char status[42];
 
-        if(a->notice[0]) {
+        if(a->playing) {
+
+            snprintf(
+                status,
+                sizeof(status),
+                "Playing %u/%u Back:Stop",
+                (unsigned)(a->play_index + 1),
+                (unsigned)a->count);
+
+        } else if(a->notice[0]) {
+
             snprintf(
                 status,
                 sizeof(status),
@@ -501,6 +574,7 @@ static void draw_callback(
                 a->notice);
 
         } else if(a->count) {
+
             Note n =
                 a->notes[a->selected];
 
@@ -528,6 +602,7 @@ static void draw_callback(
                 (unsigned)a->count);
 
         } else {
+
             snprintf(
                 status,
                 sizeof(status),
@@ -538,6 +613,7 @@ static void draw_callback(
             canvas, 2, 63, status);
 
     } else if(a->screen == ScreenMenu) {
+
         canvas_draw_str(
             canvas, 2, 11, "Score tools");
 
@@ -567,12 +643,15 @@ static void draw_callback(
         }
 
     } else {
+
         const char* title =
             a->screen == ScreenPitch ?
             "Choose pitch" :
             a->screen == ScreenDuration ?
             (a->adding_rest ?
              "Rest length" : "Note length") :
+            a->screen == ScreenTempo ?
+            "Playback tempo" :
             "Time signature";
 
         canvas_draw_str(
@@ -584,6 +663,7 @@ static void draw_callback(
         char line[24];
 
         if(a->screen == ScreenPitch) {
+
             pitch_label(
                 a->pitch,
                 line,
@@ -597,6 +677,7 @@ static void draw_callback(
                 "Up/Down OK:Next");
 
         } else if(a->screen == ScreenDuration) {
+
             canvas_draw_str(
                 canvas,
                 8, 33,
@@ -606,7 +687,23 @@ static void draw_callback(
                 canvas, 2, 61,
                 "Up/Down OK:Insert");
 
+        } else if(a->screen == ScreenTempo) {
+
+            snprintf(
+                line,
+                sizeof(line),
+                "%u BPM",
+                (unsigned)a->tempo);
+
+            canvas_draw_str(
+                canvas, 8, 33, line);
+
+            canvas_draw_str(
+                canvas, 2, 61,
+                "Up/Down +/-5 OK:Set");
+
         } else {
+
             snprintf(
                 line,
                 sizeof(line),
@@ -671,9 +768,11 @@ static bool write_score(
         FSOM_CREATE_ALWAYS);
 
     if(ok) {
+
         char buf[512];
 
         if(!xml) {
+
             ok = file_write_text(
                 file, "BSC2\n");
 
@@ -714,6 +813,7 @@ static bool write_score(
             }
 
         } else {
+
             ok = file_write_text(
                 file,
                 "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
@@ -722,7 +822,8 @@ static bool write_score(
                 "<movement-title>Bard's Melody</movement-title>"
                 "<part-list><score-part id=\"P1\">"
                 "<part-name>Hulusi</part-name>"
-                "</score-part></part-list><part id=\"P1\">\n");
+                "</score-part></part-list>"
+                "<part id=\"P1\">\n");
 
             uint16_t measure = 1;
             uint8_t used = 0;
@@ -752,6 +853,7 @@ static bool write_score(
                 }
 
                 if(!open && ok) {
+
                     snprintf(
                         buf,
                         sizeof(buf),
@@ -764,6 +866,7 @@ static bool write_score(
                     open = true;
 
                     if(measure == 2 && ok) {
+
                         snprintf(
                             buf,
                             sizeof(buf),
@@ -786,6 +889,7 @@ static bool write_score(
                 if(!ok) break;
 
                 if(n.rest) {
+
                     snprintf(
                         buf,
                         sizeof(buf),
@@ -796,6 +900,7 @@ static bool write_score(
                         xml_types[n.duration]);
 
                 } else {
+
                     uint8_t pc =
                         n.pitch % 12;
 
@@ -929,6 +1034,7 @@ static bool write_score(
                 used += ticks;
 
                 if(used >= cap && ok) {
+
                     ok = file_write_text(
                         file, "</measure>\n");
 
@@ -959,6 +1065,7 @@ static bool write_score(
 }
 
 static bool load_score(AppState* a) {
+
     Storage* storage =
         furi_record_open(RECORD_STORAGE);
 
@@ -972,6 +1079,7 @@ static bool load_score(AppState* a) {
         FSOM_OPEN_EXISTING);
 
     if(ok) {
+
         Note temp[MAX_NOTES];
 
         uint16_t count = 0;
@@ -987,6 +1095,7 @@ static bool load_score(AppState* a) {
         size_t pos = 0;
 
         while(valid) {
+
             char c;
 
             size_t read =
@@ -1001,11 +1110,14 @@ static bool load_score(AppState* a) {
             if(c == '\r') continue;
 
             if(c == '\n') {
+
                 line[pos] = '\0';
 
                 if(line_no == 0) {
+
                     if(strcmp(line, "BSC2") == 0) {
                         v2 = true;
+
                     } else if(
                         strcmp(line, "BSC1") != 0) {
 
@@ -1013,6 +1125,7 @@ static bool load_score(AppState* a) {
                     }
 
                 } else if(v2 && line_no == 1) {
+
                     unsigned b, d;
 
                     if(
@@ -1072,6 +1185,7 @@ static bool load_score(AppState* a) {
                         valid = false;
 
                     } else {
+
                         temp[count++] = (Note){
                             (uint8_t)p,
                             (uint8_t)d,
@@ -1112,6 +1226,7 @@ static bool load_score(AppState* a) {
             line_no >= (v2 ? 2 : 1);
 
         if(ok) {
+
             memcpy(
                 a->notes,
                 temp,
@@ -1123,6 +1238,7 @@ static bool load_score(AppState* a) {
             a->beat_type = denom;
 
             for(uint8_t i = 0; i < 4; ++i) {
+
                 if(
                     time_beats[i] == beats &&
                     time_denoms[i] == denom) {
@@ -1140,7 +1256,9 @@ static bool load_score(AppState* a) {
 }
 
 static void insert_note(AppState* a) {
+
     if(a->count >= MAX_NOTES) {
+
         snprintf(
             a->notice,
             sizeof(a->notice),
@@ -1154,6 +1272,7 @@ static void insert_note(AppState* a) {
         a->selected + 1 : 0;
 
     if(at < a->count) {
+
         memmove(
             &a->notes[at + 1],
             &a->notes[at],
@@ -1170,7 +1289,248 @@ static void insert_note(AppState* a) {
     a->selected = at;
 }
 
+/*
+ * SOUND PLAYBACK
+ *
+ * Convert MIDI notes to frequencies.
+ * A4 (MIDI 69) = 440 Hz.
+ */
+
+static float pitch_hz(uint8_t midi) {
+
+    static const float c4[12] = {
+        261.626f,
+        277.183f,
+        293.665f,
+        311.127f,
+        329.628f,
+        349.228f,
+        369.994f,
+        391.995f,
+        415.305f,
+        440.000f,
+        466.164f,
+        493.883f
+    };
+
+    float hz = c4[midi % 12];
+
+    int octave =
+        (int)midi / 12 - 5;
+
+    while(octave > 0) {
+        hz *= 2.0f;
+        octave--;
+    }
+
+    while(octave < 0) {
+        hz *= 0.5f;
+        octave++;
+    }
+
+    return hz;
+}
+
+static void playback_stop(AppState* a) {
+
+    if(a->sounding) {
+
+        furi_hal_speaker_stop();
+        a->sounding = false;
+    }
+
+    if(a->speaker_owned) {
+
+        furi_hal_speaker_release();
+        a->speaker_owned = false;
+    }
+
+    a->playing = false;
+}
+
+static bool time_reached(
+    uint32_t now,
+    uint32_t deadline) {
+
+    return (int32_t)(now - deadline) >= 0;
+}
+
+static void playback_start_note(
+    AppState* a,
+    uint32_t now) {
+
+    if(a->play_index >= a->play_end) {
+
+        playback_stop(a);
+        return;
+    }
+
+    Note n = a->notes[a->play_index];
+
+    uint32_t ms =
+        (uint32_t)(60000UL / a->tempo) *
+        duration_ticks(n.duration) / 4;
+
+    if(n.fermata && !n.rest) {
+        ms += ms / 2;
+    }
+
+    if(ms < 20) {
+        ms = 20;
+    }
+
+    a->note_end_tick =
+        now + furi_ms_to_ticks(ms);
+
+    a->sound_end_tick =
+        a->note_end_tick;
+
+    if(!n.rest) {
+
+        bool tied_forward =
+            n.tie == 1 &&
+            a->play_index + 1 < a->play_end &&
+            a->notes[a->play_index + 1].tie == 2 &&
+            a->notes[a->play_index + 1].pitch ==
+            n.pitch;
+
+        bool tied_back =
+            n.tie == 2 &&
+            a->play_index > 0 &&
+            a->notes[a->play_index - 1].tie == 1 &&
+            a->notes[a->play_index - 1].pitch ==
+            n.pitch;
+
+        bool slurred =
+            n.slur != 0;
+
+        uint32_t gap =
+            n.staccato ?
+            ms / 2 :
+            (slurred ||
+             tied_forward ||
+             tied_back ? 0 : 35);
+
+        if(gap >= ms) {
+            gap = ms / 4;
+        }
+
+        a->sound_end_tick =
+            now + furi_ms_to_ticks(ms - gap);
+
+        if(!tied_back || !a->sounding) {
+
+            if(a->sounding) {
+
+                furi_hal_speaker_stop();
+                a->sounding = false;
+            }
+
+            furi_hal_speaker_start(
+                pitch_hz(n.pitch),
+                n.accent ? 0.8f : 0.5f);
+
+            a->sounding = true;
+        }
+
+        if(tied_forward) {
+            a->sound_end_tick =
+                a->note_end_tick;
+        }
+
+    } else if(a->sounding) {
+
+        furi_hal_speaker_stop();
+        a->sounding = false;
+    }
+
+    a->selected = a->play_index;
+}
+
+static void playback_begin(
+    AppState* a,
+    uint16_t from,
+    bool single) {
+
+    playback_stop(a);
+
+    if(from >= a->count) {
+
+        snprintf(
+            a->notice,
+            sizeof(a->notice),
+            "No notes to play");
+
+        return;
+    }
+
+    if(!furi_hal_speaker_acquire(100)) {
+
+        snprintf(
+            a->notice,
+            sizeof(a->notice),
+            "Speaker busy");
+
+        return;
+    }
+
+    a->speaker_owned = true;
+    a->playing = true;
+
+    a->play_index = from;
+
+    a->play_end =
+        single ? from + 1 : a->count;
+
+    playback_start_note(
+        a, furi_get_tick());
+}
+
+static void playback_update(AppState* a) {
+
+    if(!a->playing) return;
+
+    uint32_t now = furi_get_tick();
+
+    if(
+        a->sounding &&
+        time_reached(
+            now, a->sound_end_tick)) {
+
+        Note n =
+            a->notes[a->play_index];
+
+        bool tied_forward =
+            n.tie == 1 &&
+            a->play_index + 1 < a->play_end &&
+            a->notes[a->play_index + 1].tie == 2 &&
+            a->notes[a->play_index + 1].pitch ==
+            n.pitch;
+
+        if(
+            !tied_forward ||
+            time_reached(
+                now, a->note_end_tick)) {
+
+            if(!tied_forward) {
+
+                furi_hal_speaker_stop();
+                a->sounding = false;
+            }
+        }
+    }
+
+    if(time_reached(
+        now, a->note_end_tick)) {
+
+        a->play_index++;
+
+        playback_start_note(a, now);
+    }
+}
+
 static void do_menu(AppState* a) {
+
     Note* n =
         a->count ?
         &a->notes[a->selected] : NULL;
@@ -1178,6 +1538,7 @@ static void do_menu(AppState* a) {
     a->notice[0] = '\0';
 
     switch(a->menu) {
+
     case 0:
         a->adding_rest = true;
         a->screen = ScreenDuration;
@@ -1267,12 +1628,31 @@ static void do_menu(AppState* a) {
             sizeof(a->notice),
             "Score cleared");
         break;
+
+    case 13:
+        playback_begin(a, 0, false);
+        break;
+
+    case 14:
+        playback_begin(
+            a, a->selected, false);
+        break;
+
+    case 15:
+        playback_begin(
+            a, a->selected, true);
+        break;
+
+    case 16:
+        a->screen = ScreenTempo;
+        return;
     }
 
     a->screen = ScreenScore;
 }
 
 int32_t bards_score_app(void* p) {
+
     UNUSED(p);
 
     AppState* a =
@@ -1314,11 +1694,15 @@ int32_t bards_score_app(void* p) {
     }
 
     a->running = true;
+
     a->pitch = 69;
     a->duration = 2;
+
     a->beats = 4;
     a->beat_type = 4;
     a->time_choice = 2;
+
+    a->tempo = 120;
 
     view_port_draw_callback_set(
         a->viewport,
@@ -1343,22 +1727,53 @@ int32_t bards_score_app(void* p) {
     InputEvent ev;
 
     while(a->running) {
-        if(
+
+        FuriStatus event_status =
             furi_message_queue_get(
                 a->queue,
                 &ev,
-                FuriWaitForever) != FuriStatusOk) {
-
-            continue;
-        }
+                a->playing ?
+                furi_ms_to_ticks(10) :
+                FuriWaitForever);
 
         furi_mutex_acquire(
             a->mutex,
             FuriWaitForever);
 
+        if(event_status != FuriStatusOk) {
+
+            playback_update(a);
+
+            furi_mutex_release(a->mutex);
+            view_port_update(a->viewport);
+
+            continue;
+        }
+
         a->notice[0] = '\0';
 
+        if(a->playing) {
+
+            if(
+                ev.key == InputKeyBack &&
+                ev.type == InputTypeShort) {
+
+                playback_stop(a);
+
+                snprintf(
+                    a->notice,
+                    sizeof(a->notice),
+                    "Playback stopped");
+            }
+
+            furi_mutex_release(a->mutex);
+            view_port_update(a->viewport);
+
+            continue;
+        }
+
         if(a->screen == ScreenScore) {
+
             if(
                 ev.key == InputKeyBack &&
                 ev.type == InputTypeShort) {
@@ -1374,7 +1789,9 @@ int32_t bards_score_app(void* p) {
                 a->screen = ScreenMenu;
 
             } else if(ev.type == InputTypeShort) {
+
                 if(ev.key == InputKeyOk) {
+
                     a->adding_rest = false;
                     a->screen = ScreenPitch;
 
@@ -1409,6 +1826,7 @@ int32_t bards_score_app(void* p) {
             }
 
         } else if(a->screen == ScreenPitch) {
+
             if(
                 ev.key == InputKeyBack &&
                 ev.type == InputTypeShort) {
@@ -1416,6 +1834,7 @@ int32_t bards_score_app(void* p) {
                 a->screen = ScreenScore;
 
             } else if(ev.type == InputTypeShort) {
+
                 if(
                     ev.key == InputKeyUp &&
                     a->pitch < 95) {
@@ -1429,11 +1848,13 @@ int32_t bards_score_app(void* p) {
                     a->pitch--;
 
                 } else if(ev.key == InputKeyOk) {
+
                     a->screen = ScreenDuration;
                 }
             }
 
         } else if(a->screen == ScreenDuration) {
+
             if(
                 ev.key == InputKeyBack &&
                 ev.type == InputTypeShort) {
@@ -1443,6 +1864,7 @@ int32_t bards_score_app(void* p) {
                     ScreenScore : ScreenPitch;
 
             } else if(ev.type == InputTypeShort) {
+
                 if(
                     ev.key == InputKeyUp &&
                     a->duration > 0) {
@@ -1456,12 +1878,14 @@ int32_t bards_score_app(void* p) {
                     a->duration++;
 
                 } else if(ev.key == InputKeyOk) {
+
                     insert_note(a);
                     a->screen = ScreenScore;
                 }
             }
 
         } else if(a->screen == ScreenTime) {
+
             if(
                 ev.key == InputKeyBack &&
                 ev.type == InputTypeShort) {
@@ -1469,6 +1893,7 @@ int32_t bards_score_app(void* p) {
                 a->screen = ScreenScore;
 
             } else if(ev.type == InputTypeShort) {
+
                 if(
                     ev.key == InputKeyUp &&
                     a->time_choice > 0) {
@@ -1482,6 +1907,7 @@ int32_t bards_score_app(void* p) {
                     a->time_choice++;
 
                 } else if(ev.key == InputKeyOk) {
+
                     a->beats =
                         time_beats[a->time_choice];
 
@@ -1492,7 +1918,8 @@ int32_t bards_score_app(void* p) {
                 }
             }
 
-        } else if(a->screen == ScreenMenu) {
+        } else if(a->screen == ScreenTempo) {
+
             if(
                 ev.key == InputKeyBack &&
                 ev.type == InputTypeShort) {
@@ -1500,6 +1927,35 @@ int32_t bards_score_app(void* p) {
                 a->screen = ScreenScore;
 
             } else if(ev.type == InputTypeShort) {
+
+                if(
+                    ev.key == InputKeyUp &&
+                    a->tempo < 240) {
+
+                    a->tempo += 5;
+
+                } else if(
+                    ev.key == InputKeyDown &&
+                    a->tempo > 40) {
+
+                    a->tempo -= 5;
+
+                } else if(ev.key == InputKeyOk) {
+
+                    a->screen = ScreenScore;
+                }
+            }
+
+        } else if(a->screen == ScreenMenu) {
+
+            if(
+                ev.key == InputKeyBack &&
+                ev.type == InputTypeShort) {
+
+                a->screen = ScreenScore;
+
+            } else if(ev.type == InputTypeShort) {
+
                 if(
                     ev.key == InputKeyUp &&
                     a->menu > 0) {
@@ -1513,6 +1969,7 @@ int32_t bards_score_app(void* p) {
                     a->menu++;
 
                 } else if(ev.key == InputKeyOk) {
+
                     do_menu(a);
                 }
 
@@ -1529,6 +1986,8 @@ int32_t bards_score_app(void* p) {
         furi_mutex_release(a->mutex);
         view_port_update(a->viewport);
     }
+
+    playback_stop(a);
 
     gui_remove_view_port(
         gui, a->viewport);
