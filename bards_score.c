@@ -73,14 +73,31 @@ static int note_step(uint8_t p) {return ((int)p / 12 - 5) * 7 + degree_pc[p % 12
 static int step_y(int step) {return STAFF_BOTTOM - (step * STAFF_SPACING + (step >= 0 ? 1 : -1)) / 2;}
 static int note_y(uint8_t p) {return step_y(note_step(p));}
 
+/* A hand-traced G clef, drawn as a continuous curved pixel path.
+ * Its main curl crosses the G line (second line from the bottom).
+ * This deliberately uses only stable Canvas drawing primitives.
+ */
+static void draw_treble_clef(Canvas* c) {
+    static const int8_t points[][2] = {
+        {13,54}, {10,52}, {9,49}, {10,45}, {13,40},
+        {17,34}, {19,28}, {19,22}, {17,17}, {14,15},
+        {12,17}, {11,21}, {12,26}, {15,31}, {18,35},
+        {20,40}, {20,44}, {18,48}, {15,49}, {11,48},
+        {8,45}, {7,41}, {8,37}, {11,34}, {15,33},
+        {19,34}, {21,37}, {21,40}, {19,43}, {16,44},
+        {13,43}, {12,41}, {13,38}, {16,37}
+    };
+    for(size_t i = 1; i < sizeof(points) / sizeof(points[0]); ++i) {
+        canvas_draw_line(c, points[i - 1][0], points[i - 1][1], points[i][0], points[i][1]);
+    }
+    /* Slightly strengthen the centre of the spiral at this resolution. */
+    canvas_draw_line(c, 12, 40, 14, 38);
+}
+
 static void draw_staff(Canvas* c) {
-    for(int i = 0; i < 5; ++i) canvas_draw_line(c, 2, STAFF_BOTTOM - i * STAFF_SPACING, 125, STAFF_BOTTOM - i * STAFF_SPACING);
-    canvas_draw_line(c, 12, 11, 12, 49);
-    canvas_draw_circle(c, 12, 32, 6);
-    canvas_draw_circle(c, 12, 39, 3);
-    canvas_draw_line(c, 12, 11, 16, 16);
-    canvas_draw_line(c, 16, 16, 12, 24);
-    canvas_draw_line(c, 12, 49, 9, 53);
+    for(int i = 0; i < 5; ++i)
+        canvas_draw_line(c, 2, STAFF_BOTTOM - i * STAFF_SPACING, 125, STAFF_BOTTOM - i * STAFF_SPACING);
+    draw_treble_clef(c);
 }
 
 static void draw_accidental(Canvas* c, int x, int y, int alter) {
@@ -197,12 +214,32 @@ static void draw_note(Canvas* c, const AppState* a, int x, Note n, bool selected
             }
         }
     }
-    if(n.staccato) canvas_draw_disc(c, x, y < 28 ? y + 7 : y - 7, 1);
+    /* A true staccato dot: 2x2 pixels, not a radius-1 disc (which
+     * resembles a plus on this display). Clear any stave line behind it.
+     */
+    if(n.staccato) {
+        int dot_y = y < 28 ? y + 9 : y - 9;
+        canvas_set_color(c, ColorWhite);
+        canvas_draw_box(c, x - 2, dot_y - 2, 5, 5);
+        canvas_set_color(c, ColorBlack);
+        canvas_draw_box(c, x - 1, dot_y - 1, 2, 2);
+    }
     if(n.accent) {
         canvas_draw_line(c, x - 4, y - 9, x + 2, y - 11);
         canvas_draw_line(c, x + 2, y - 11, x - 4, y - 13);
     }
-    if(n.fermata) {canvas_draw_circle(c, x, y - 13, 4); canvas_draw_disc(c, x, y - 13, 1);}
+    /* Fermata: open arch over a separate dot, never a full circle.
+     * Move it further out when the note also carries an accent.
+     */
+    if(n.fermata) {
+        int fy = y - (n.accent ? 23 : 17);
+        canvas_draw_line(c, x - 6, fy + 2, x - 5, fy - 1);
+        canvas_draw_line(c, x - 5, fy - 1, x - 2, fy - 3);
+        canvas_draw_line(c, x - 2, fy - 3, x + 2, fy - 3);
+        canvas_draw_line(c, x + 2, fy - 3, x + 5, fy - 1);
+        canvas_draw_line(c, x + 5, fy - 1, x + 6, fy + 2);
+        canvas_draw_box(c, x, fy, 2, 2);
+    }
     if(selected) canvas_draw_frame(c, x - 5, y - 5, 11, 11);
 }
 
@@ -467,6 +504,22 @@ static bool load_score(AppState* a) {
     return ok;
 }
 
+/* Remove the selected event and keep the cursor on a valid note.
+ * Barlines and beaming are computed from the remaining score on redraw.
+ */
+static void delete_selected_note(AppState* a) {
+    if(a->count == 0) return;
+    uint16_t at = a->selected;
+    if(at + 1 < a->count) {
+        memmove(&a->notes[at], &a->notes[at + 1],
+            (a->count - at - 1) * sizeof(Note));
+    }
+    a->count--;
+    if(a->count == 0) a->selected = 0;
+    else if(a->selected >= a->count) a->selected = a->count - 1;
+    snprintf(a->notice, sizeof(a->notice), "Note deleted");
+}
+
 static void insert_note(AppState* a) {
     if(a->count >= MAX_NOTES) {snprintf(a->notice, sizeof(a->notice), "Score full"); return;}
     uint16_t at = a->count ? a->selected + 1 : 0;
@@ -591,7 +644,8 @@ int32_t bards_score_app(void* p) {
             furi_mutex_release(a->mutex); view_port_update(a->viewport); continue;
         }
         if(a->screen == ScreenScore) {
-            if(ev.key == InputKeyBack && ev.type == InputTypeShort) a->running = false;
+            if(ev.key == InputKeyBack && ev.type == InputTypeLong) a->running = false;
+            else if(ev.key == InputKeyBack && ev.type == InputTypeShort) delete_selected_note(a);
             else if(ev.key == InputKeyOk && ev.type == InputTypeLong) {a->menu = 0; a->menu_top = 0; a->screen = ScreenMenu;}
             else if(ev.type == InputTypeShort) {
                 if(ev.key == InputKeyOk) {a->adding_rest = false; a->screen = ScreenPitch;}
@@ -639,8 +693,11 @@ int32_t bards_score_app(void* p) {
         } else if(a->screen == ScreenMenu) {
             if(ev.key == InputKeyBack && ev.type == InputTypeShort) a->screen = ScreenScore;
             else if(ev.type == InputTypeShort) {
-                if(ev.key == InputKeyUp && a->menu > 0) a->menu--;
-                else if(ev.key == InputKeyDown && a->menu + 1 < MENU_COUNT) a->menu++;
+                if(ev.key == InputKeyUp) {
+                    a->menu = a->menu == 0 ? MENU_COUNT - 1 : a->menu - 1;
+                } else if(ev.key == InputKeyDown) {
+                    a->menu = a->menu + 1 >= MENU_COUNT ? 0 : a->menu + 1;
+                }
                 else if(ev.key == InputKeyOk) do_menu(a);
                 if(a->menu < a->menu_top) a->menu_top = a->menu;
                 if(a->menu >= a->menu_top + 4) a->menu_top = a->menu - 3;
