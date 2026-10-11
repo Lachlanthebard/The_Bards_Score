@@ -477,7 +477,7 @@ static void input_callback(InputEvent* e, void* ctx) {
 static bool file_write_text(File* f, const char* s) {size_t n = strlen(s); return storage_file_write(f, s, n) == n;}
 
 static bool write_xml_note(File* f, AppState* a, Note n, uint8_t voice, bool chord, uint8_t pitch) {
-    char b[360]; uint8_t ticks = duration_ticks(n.duration);
+    char b[768]; uint8_t ticks = duration_ticks(n.duration);
     if(n.rest) snprintf(b, sizeof(b), "<note><rest/><duration>%u</duration><voice>%u</voice><type>%s</type></note>\n", ticks, voice, xml_types[n.duration]);
     else {
         uint8_t letter; int alter; spell_pitch(a, pitch, &letter, &alter);
@@ -795,13 +795,13 @@ static void playback_begin_both(AppState* a) {
 
 static void playback_update_both(AppState* a) {
     uint32_t now = furi_get_tick();
-    uint32_t elapsed_ms = furi_ticks_to_ms(now - a->both_start);
+    uint32_t elapsed_ms = ((uint32_t)(((uint64_t)(now - a->both_start) * 1000U) / furi_ms_to_ticks(1000)));
     uint32_t quarter_ms = 60000UL / a->tempo;
     uint32_t tick = elapsed_ms * 4 / quarter_ms;
     uint32_t total1 = voice_total_ticks(a->notes, a->count);
     uint32_t total2 = voice_total_ticks(a->other_notes, a->other_count);
     if(tick >= (total1 > total2 ? total1 : total2)) {playback_stop(a); return;}
-    if(furi_ticks_to_ms(now - a->both_last_sound) < 22) return;
+    if((now - a->both_last_sound) < furi_ms_to_ticks(22)) return;
     a->both_last_sound = now;
     Note n1, n2;
     bool has1 = voice_at(a->notes, a->count, tick, &n1);
