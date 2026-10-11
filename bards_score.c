@@ -14,7 +14,7 @@
 #define XML_FILE SCORE_DIR "/melody.musicxml"
 #define STAFF_BOTTOM 47
 #define STAFF_SPACING 7
-#define MENU_COUNT 24
+#define MENU_COUNT 25
 #define VISIBLE_NOTES 5
 
 typedef struct {
@@ -22,7 +22,7 @@ typedef struct {
     uint8_t chord_count, chord[3];
 } Note;
 
-typedef enum {ScreenScore, ScreenPitch, ScreenDuration, ScreenMenu, ScreenTime, ScreenTempo, ScreenKey} Screen;
+typedef enum {ScreenScore, ScreenPitch, ScreenDuration, ScreenMenu, ScreenTime, ScreenTempo, ScreenKey, ScreenAbout} Screen;
 
 typedef struct {
     FuriMutex* mutex;
@@ -31,6 +31,7 @@ typedef struct {
     Note notes[MAX_NOTES];
     Note other_notes[MAX_NOTES];
     uint16_t other_count, other_selected;
+    uint8_t about_page;
     uint8_t voice;
     bool combined, separate_staves, chord_edit;
     uint8_t chord_pitch;
@@ -58,7 +59,7 @@ static const char* const menu_items[MENU_COUNT] = {
     "Save score", "Load score", "Export XML", "Clear score",
     "Play score", "Play from here", "Preview note", "Set tempo",
     "Switch voice", "Combined/solo view", "Add chord tone", "Remove chord tone",
-    "XML staff layout", "Play both voices"
+    "XML staff layout", "Play both voices", "About / Help"
 };
 static const uint8_t time_beats[] = {2, 3, 4, 6};
 static const uint8_t time_denoms[] = {4, 4, 4, 8};
@@ -444,6 +445,22 @@ static void draw_callback(Canvas* c, void* ctx) {
             snprintf(status, sizeof(status), "%s %s %u/%u", label, durations[n.duration], (unsigned)(a->selected + 1), (unsigned)a->count);
         } else snprintf(status, sizeof(status), "OK:Add Hold OK:Tools");
         canvas_draw_str(c, 2, 63, status);
+    } else if(a->screen == ScreenAbout) {
+        static const char* const help[][5] = {
+            {"Bard's Score v1.6", "Music notation for Flipper", "Created by Lachlan The Bard", "Up/Down: change page", "Back: return to tools"},
+            {"1/8 - Editing", "OK: add note", "Left/Right: select note", "Up/Down: semitone", "Back: delete; hold: exit"},
+            {"2/8 - Note entry", "OK: choose pitch", "Up/Down: adjust pitch", "OK: choose duration", "OK: insert note"},
+            {"3/8 - Score tools", "Hold OK: open tools", "Up/Down: choose action", "OK: apply action", "Back: return to score"},
+            {"4/8 - Notation", "Rests and time signatures", "Major/minor key signatures", "Slurs, ties, articulations", "Set tempo in Score tools"},
+            {"5/8 - Chords", "Select an existing note", "Tools > Add chord tone", "Choose pitch, press OK", "Up to four pitches per chord"},
+            {"6/8 - Voices", "Tools > Switch voice", "Edit each voice separately", "Combined/solo view toggle", "Play both voices in tools"},
+            {"7/8 - Files / XML", "Tools: Save, Load, Export", "BSC4 native score format", "XML: one or two staves", "Back up melody.bsc first"},
+            {"8/8 - Playback", "Play score or from here", "Preview selected note", "Back: stop playback", "Speaker polyphony simulated"},
+        };
+        uint8_t page = a->about_page;
+        canvas_draw_str(c, 2, 11, help[page][0]);
+        canvas_set_font(c, FontSecondary);
+        for(uint8_t i = 1; i < 5; ++i) canvas_draw_str(c, 2, 11 + i * 11, help[page][i]);
     } else if(a->screen == ScreenMenu) {
         canvas_draw_str(c, 2, 11, "Score tools");
         canvas_set_font(c, FontSecondary);
@@ -863,6 +880,7 @@ static void do_menu(AppState* a) {
     case 21: if(n && n->chord_count) {n->chord_count--; snprintf(a->notice, sizeof(a->notice), "Chord tone removed");} else snprintf(a->notice, sizeof(a->notice), "No chord tones"); break;
     case 22: a->separate_staves = !a->separate_staves; snprintf(a->notice, sizeof(a->notice), a->separate_staves ? "XML: 2 staves" : "XML: 1 staff"); break;
     case 23: playback_begin_both(a); break;
+    case 24: a->about_page = 0; a->screen = ScreenAbout; return;
     }
     a->screen = ScreenScore;
 }
@@ -948,6 +966,13 @@ int32_t bards_score_app(void* p) {
                 if(ev.key == InputKeyUp && a->tempo < 240) a->tempo += 5;
                 else if(ev.key == InputKeyDown && a->tempo > 40) a->tempo -= 5;
                 else if(ev.key == InputKeyOk) a->screen = ScreenScore;
+            }
+        } else if(a->screen == ScreenAbout) {
+            if(ev.key == InputKeyBack && ev.type == InputTypeShort) a->screen = ScreenMenu;
+            else if(ev.type == InputTypeShort) {
+                if(ev.key == InputKeyUp) a->about_page = a->about_page == 0 ? 8 : a->about_page - 1;
+                else if(ev.key == InputKeyDown) a->about_page = a->about_page == 8 ? 0 : a->about_page + 1;
+                else if(ev.key == InputKeyOk) a->about_page = (a->about_page + 1) % 9;
             }
         } else if(a->screen == ScreenMenu) {
             if(ev.key == InputKeyBack && ev.type == InputTypeShort) a->screen = ScreenScore;
