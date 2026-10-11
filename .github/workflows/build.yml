@@ -50,6 +50,8 @@ jobs:
             momentum/applications_user/bards_score/
           cp bards-score/application.fam \
             momentum/applications_user/bards_score/
+          cp bards-score/bards_score_icon.png \
+            momentum/applications_user/bards_score/
 
       - name: Build Bard's Score FAP
         working-directory: momentum
@@ -72,4 +74,3 @@ jobs:
           name: Bards-Score-Momentum
           path: output/bards_score.fap
           if-no-files-found: error
-          
