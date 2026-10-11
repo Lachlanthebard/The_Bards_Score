@@ -73,31 +73,55 @@ static int note_step(uint8_t p) {return ((int)p / 12 - 5) * 7 + degree_pc[p % 12
 static int step_y(int step) {return STAFF_BOTTOM - (step * STAFF_SPACING + (step >= 0 ? 1 : -1)) / 2;}
 static int note_y(uint8_t p) {return step_y(note_step(p));}
 
-/* A hand-traced G clef, drawn as a continuous curved pixel path.
- * Its main curl crosses the G line (second line from the bottom).
- * This deliberately uses only stable Canvas drawing primitives.
- */
-static void draw_treble_clef(Canvas* c) {
-    static const int8_t points[][2] = {
-        {13,54}, {10,52}, {9,49}, {10,45}, {13,40},
-        {17,34}, {19,28}, {19,22}, {17,17}, {14,15},
-        {12,17}, {11,21}, {12,26}, {15,31}, {18,35},
-        {20,40}, {20,44}, {18,48}, {15,49}, {11,48},
-        {8,45}, {7,41}, {8,37}, {11,34}, {15,33},
-        {19,34}, {21,37}, {21,40}, {19,43}, {16,44},
-        {13,43}, {12,41}, {13,38}, {16,37}
-    };
-    for(size_t i = 1; i < sizeof(points) / sizeof(points[0]); ++i) {
-        canvas_draw_line(c, points[i - 1][0], points[i - 1][1], points[i][0], points[i][1]);
-    }
-    /* Slightly strengthen the centre of the spiral at this resolution. */
-    canvas_draw_line(c, 12, 40, 14, 38);
-}
-
+/* Treble clef revision: traditional G-clef shape at 128x64 resolution. */
 static void draw_staff(Canvas* c) {
-    for(int i = 0; i < 5; ++i)
-        canvas_draw_line(c, 2, STAFF_BOTTOM - i * STAFF_SPACING, 125, STAFF_BOTTOM - i * STAFF_SPACING);
-    draw_treble_clef(c);
+    for(int i = 0; i < 5; ++i) {
+        canvas_draw_line(c, 2, STAFF_BOTTOM - i * STAFF_SPACING,
+                         125, STAFF_BOTTOM - i * STAFF_SPACING);
+    }
+
+    /* Tall, narrow upper loop */
+    canvas_draw_line(c, 12, 10, 9, 14);
+    canvas_draw_line(c, 9, 14, 8, 20);
+    canvas_draw_line(c, 8, 20, 9, 26);
+    canvas_draw_line(c, 9, 26, 12, 30);
+    canvas_draw_line(c, 12, 10, 15, 14);
+    canvas_draw_line(c, 15, 14, 16, 19);
+    canvas_draw_line(c, 16, 19, 15, 24);
+    canvas_draw_line(c, 15, 24, 12, 29);
+
+    /* Sweeping S-shaped body */
+    canvas_draw_line(c, 12, 29, 8, 33);
+    canvas_draw_line(c, 8, 33, 5, 38);
+    canvas_draw_line(c, 5, 38, 5, 43);
+    canvas_draw_line(c, 5, 43, 8, 47);
+    canvas_draw_line(c, 8, 47, 13, 49);
+    canvas_draw_line(c, 13, 49, 18, 47);
+    canvas_draw_line(c, 18, 47, 21, 43);
+    canvas_draw_line(c, 12, 29, 10, 34);
+    canvas_draw_line(c, 10, 34, 8, 39);
+    canvas_draw_line(c, 8, 39, 9, 43);
+
+    /* Spiral around the G line */
+    canvas_draw_line(c, 21, 43, 21, 38);
+    canvas_draw_line(c, 21, 38, 18, 35);
+    canvas_draw_line(c, 18, 35, 13, 34);
+    canvas_draw_line(c, 13, 34, 9, 36);
+    canvas_draw_line(c, 9, 36, 8, 40);
+    canvas_draw_line(c, 8, 40, 10, 43);
+    canvas_draw_line(c, 10, 43, 14, 44);
+    canvas_draw_line(c, 14, 44, 17, 42);
+    canvas_draw_line(c, 17, 42, 17, 39);
+    canvas_draw_line(c, 17, 39, 15, 38);
+
+    /* Descending stem and hooked tail */
+    canvas_draw_line(c, 11, 27, 13, 38);
+    canvas_draw_line(c, 13, 38, 15, 48);
+    canvas_draw_line(c, 15, 48, 16, 53);
+    canvas_draw_line(c, 16, 53, 15, 57);
+    canvas_draw_line(c, 15, 57, 12, 59);
+    canvas_draw_line(c, 12, 59, 9, 58);
+    canvas_draw_disc(c, 9, 58, 2);
 }
 
 static void draw_accidental(Canvas* c, int x, int y, int alter) {
