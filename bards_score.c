@@ -93,6 +93,20 @@ static int step_y(int step) {return STAFF_BOTTOM - (step * STAFF_SPACING + (step
 static int note_y(uint8_t p) {return step_y(note_step(p));}
 
 /* Treble clef revision: traditional G-clef shape at 128x64 resolution. */
+/* A key change belongs to the note at its position and remains active
+ * until the next change. The MIDI pitches are never transposed. */
+static void active_key(const AppState* a, const Note* notes, uint16_t count,
+                       uint16_t index, int8_t* fifths, bool* minor) {
+    *fifths = a->fifths;
+    *minor = a->minor;
+    for(uint16_t i = 0; i <= index && i < count; ++i) {
+        if(notes[i].key_change) {
+            *fifths = notes[i].key_fifths;
+            *minor = notes[i].key_minor != 0;
+        }
+    }
+}
+
 static void draw_staff(Canvas* c) {
     for(int i = 0; i < 5; ++i) {
         canvas_draw_line(c, 2, STAFF_BOTTOM - i * STAFF_SPACING,
@@ -169,7 +183,7 @@ static int key_alter(int8_t fifths, uint8_t letter) {
 }
 
 /* MIDI preserves sound. Spelling prefers the selected key signature. */
-static void spell_pitch(const AppState* a, uint8_t pitch, uint8_t* letter, int* alter) {
+static void spell_pitch(int8_t fifths, uint8_t pitch, uint8_t* letter, int* alter) {
     int pc = pitch % 12;
     int best = 100;
     uint8_t best_letter = 0;
@@ -177,7 +191,7 @@ static void spell_pitch(const AppState* a, uint8_t pitch, uint8_t* letter, int* 
     for(uint8_t l = 0; l < 7; ++l) {
         for(int al = -1; al <= 1; ++al) {
             if((natural_pc[l] + al + 12) % 12 != pc) continue;
-            int cost = (al == key_alter(a->fifths, l)) ? 0 : (al == 0 ? 2 : 3);
+            int cost = (al == key_alter(fifths, l)) ? 0 : (al == 0 ? 2 : 3);
             if(cost < best) {best = cost; best_letter = l; best_alter = al;}
         }
     }
@@ -191,11 +205,11 @@ static int spelled_step(uint8_t pitch, uint8_t letter, int alter) {
     return (octave - 5) * 7 + (int)letter - 2;
 }
 
-static void draw_key_signature(Canvas* c, const AppState* a) {
-    int count = a->fifths < 0 ? -a->fifths : a->fifths;
+static void draw_key_signature(Canvas* c, int8_t fifths) {
+    int count = fifths < 0 ? -fifths : fifths;
     for(int i = 0; i < count; ++i) {
-        int step = a->fifths > 0 ? sharp_steps[i] : flat_steps[i];
-        draw_accidental(c, 23 + i * 5, step_y(step), a->fifths > 0 ? 1 : -1);
+        int step = fifths > 0 ? sharp_steps[i] : flat_steps[i];
+        draw_accidental(c, 23 + i * 5, step_y(step), fifths > 0 ? 1 : -1);
     }
 }
 
@@ -214,20 +228,20 @@ static void draw_rest(Canvas* c, int x, uint8_t d) {
     }
 }
 
-static int stem_end(const AppState* a, Note n, bool down) {
+static int stem_end(int8_t fifths, Note n, bool down) {
     uint8_t letter; int alter;
-    spell_pitch(a, n.pitch, &letter, &alter);
+    spell_pitch(fifths, n.pitch, &letter, &alter);
     int y = step_y(spelled_step(n.pitch, letter, alter));
     return y + (down ? 17 : -17);
 }
 
-static bool stem_down(const AppState* a, Note n) {
+static bool stem_down(int8_t fifths, Note n) {
     uint8_t letter; int alter;
-    spell_pitch(a, n.pitch, &letter, &alter);
+    spell_pitch(fifths, n.pitch, &letter, &alter);
     return spelled_step(n.pitch, letter, alter) >= 4;
 }
 
-static void draw_note(Canvas* c, const AppState* a, int x, Note n, bool selected, bool beamed) {
+static void draw_note(Canvas* c, int8_t fifths, int x, Note n, bool selected, bool beamed) {
     if(n.rest) {
         draw_rest(c, x, n.duration);
         if(n.dotted) canvas_draw_disc(c, x + 7, 33, 1);
@@ -235,31 +249,31 @@ static void draw_note(Canvas* c, const AppState* a, int x, Note n, bool selected
         return;
     }
     uint8_t letter; int alter;
-    spell_pitch(a, n.pitch, &letter, &alter);
+    spell_pitch(fifths, n.pitch, &letter, &alter);
     int step = spelled_step(n.pitch, letter, alter);
     int y = step_y(step);
     for(int s = -2; s >= step && s >= -14; s -= 2) canvas_draw_line(c, x - 6, step_y(s), x + 6, step_y(s));
     for(int s = 10; s <= step && s <= 22; s += 2) canvas_draw_line(c, x - 6, step_y(s), x + 6, step_y(s));
-    if(alter != key_alter(a->fifths, letter)) draw_accidental(c, x - 8, y, alter);
+    if(alter != key_alter(fifths, letter)) draw_accidental(c, x - 8, y, alter);
     if(n.duration <= 1) canvas_draw_circle(c, x, y, 3);
     else canvas_draw_disc(c, x, y, 3);
     for(uint8_t k = 0; k < n.chord_count && k < 3; ++k) {
         uint8_t cl; int ca;
-        spell_pitch(a, n.chord[k], &cl, &ca);
+        spell_pitch(fifths, n.chord[k], &cl, &ca);
         int cs = spelled_step(n.chord[k], cl, ca), cy = step_y(cs);
         for(int ls = -2; ls >= cs && ls >= -14; ls -= 2)
             canvas_draw_line(c, x - 6, step_y(ls), x + 6, step_y(ls));
         for(int ls = 10; ls <= cs && ls <= 22; ls += 2)
             canvas_draw_line(c, x - 6, step_y(ls), x + 6, step_y(ls));
-        if(ca != key_alter(a->fifths, cl)) draw_accidental(c, x - 8, cy, ca);
+        if(ca != key_alter(fifths, cl)) draw_accidental(c, x - 8, cy, ca);
         if(n.duration <= 1) canvas_draw_circle(c, x, cy, 3);
         else canvas_draw_disc(c, x, cy, 3);
     }
     if(n.dotted) canvas_draw_disc(c, x + 6, y - 2, 1);
     if(n.duration != 0) {
-        bool down = stem_down(a, n);
+        bool down = stem_down(fifths, n);
         int sx = x + (down ? -3 : 3);
-        int end = stem_end(a, n, down);
+        int end = stem_end(fifths, n, down);
         canvas_draw_line(c, sx, y, sx, end);
         if(n.duration >= 3 && !beamed) {
             int d = down ? -1 : 1;
@@ -328,11 +342,14 @@ static void draw_beams(Canvas* c, const AppState* a, uint16_t start, uint16_t en
     for(uint16_t i = start; i + 1 < end; ++i) {
         if(!can_beam(a, i)) continue;
         Note n = a->notes[i], next = a->notes[i + 1];
-        bool down = stem_down(a, n);
-        if(stem_down(a, next) != down) continue;
+        int8_t key1, key2; bool minor1, minor2;
+        active_key(a, a->notes, a->count, i, &key1, &minor1);
+        active_key(a, a->notes, a->count, i + 1, &key2, &minor2);
+        bool down = stem_down(key1, n);
+        if(stem_down(key2, next) != down) continue;
         int x1 = x0 + (i - start) * spacing + (down ? -3 : 3);
         int x2 = x0 + (i + 1 - start) * spacing + (down ? -3 : 3);
-        int y1 = stem_end(a, n, down), y2 = stem_end(a, next, down);
+        int y1 = stem_end(key1, n, down), y2 = stem_end(key2, next, down);
         /* Both stem endpoints are joined. A second beam is used for two sixteenths. */
         canvas_draw_line(c, x1, y1, x2, y2);
         canvas_draw_line(c, x1, y1 + 1, x2, y2 + 1);
@@ -380,8 +397,11 @@ static void draw_combined_events(Canvas* c, AppState* a, int x0, uint8_t visible
         if(slot >= first) {
             int x = x0 + shown * 16;
             if(t && t % cap == 0) canvas_draw_line(c, x - 8, 19, x - 8, STAFF_BOTTOM);
-            if(has2) draw_note(c, a, x + (has1 ? 2 : 0), a->other_notes[j], false, false);
-            if(has1) draw_note(c, a, x - (has2 ? 2 : 0), a->notes[i], i == a->selected, false);
+            int8_t k1, k2; bool m1, m2;
+            active_key(a, a->notes, a->count, i, &k1, &m1);
+            active_key(a, a->other_notes, a->other_count, j, &k2, &m2);
+            if(has2) draw_note(c, k2, x + (has1 ? 2 : 0), a->other_notes[j], false, false);
+            if(has1) draw_note(c, k1, x - (has2 ? 2 : 0), a->notes[i], i == a->selected, false);
             ++shown;
         }
         if(has1) {t1 += note_ticks(a->notes[i]); ++i;}
@@ -397,20 +417,22 @@ static void draw_callback(Canvas* c, void* ctx) {
     canvas_set_font(c, FontPrimary);
     if(a->screen == ScreenScore) {
         char header[40];
+        int8_t display_fifths; bool display_minor;
+        active_key(a, a->notes, a->count, a->selected, &display_fifths, &display_minor);
         snprintf(header, sizeof(header), "V%u%s %u/%u %s %s %u", (unsigned)a->voice + 1, a->combined ? "+" : "", a->beats, a->beat_type,
-            a->minor ? minor_names[a->fifths + 7] : major_names[a->fifths + 7],
-            a->minor ? "m" : "", (unsigned)a->tempo);
+            display_minor ? minor_names[display_fifths + 7] : major_names[display_fifths + 7],
+            display_minor ? "m" : "", (unsigned)a->tempo);
         canvas_set_font(c, FontSecondary);
         canvas_draw_str(c, 2, 9, header);
         draw_staff(c);
-        draw_key_signature(c, a);
+        draw_key_signature(c, display_fifths);
         if(a->combined) {
-            int sig_count = a->fifths < 0 ? -a->fifths : a->fifths;
+            int sig_count = display_fifths < 0 ? -display_fifths : display_fifths;
             uint8_t visible = sig_count >= 5 ? 3 : (sig_count >= 3 ? 4 : VISIBLE_NOTES);
             draw_combined_events(c, a, 38 + sig_count * 5, visible);
         } else {
         uint16_t start = a->selected > 2 ? a->selected - 2 : 0;
-        int sig_count = a->fifths < 0 ? -a->fifths : a->fifths;
+        int sig_count = display_fifths < 0 ? -display_fifths : display_fifths;
         uint8_t visible = sig_count >= 5 ? 3 : (sig_count >= 3 ? 4 : VISIBLE_NOTES);
         uint16_t end = start + visible;
         if(end > a->count) end = a->count;
@@ -423,12 +445,31 @@ static void draw_callback(Canvas* c, void* ctx) {
             int x = x0 + (i - start) * spacing;
             uint8_t ticks = note_ticks(a->notes[i]);
             if(used && used + ticks > cap) {canvas_draw_line(c, x - 8, 19, x - 8, STAFF_BOTTOM); used = 0;}
-            bool beamed = (i > 0 && can_beam(a, i - 1) && stem_down(a, a->notes[i - 1]) == stem_down(a, a->notes[i])) ||
-                          (can_beam(a, i) && stem_down(a, a->notes[i]) == stem_down(a, a->notes[i + 1]));
-            draw_note(c, a, x, a->notes[i], i == a->selected, beamed);
+            int8_t current_key, prev_key, next_key; bool current_minor, dummy_minor;
+            active_key(a, a->notes, a->count, i, &current_key, &current_minor);
+            active_key(a, a->notes, a->count, i ? i - 1 : 0, &prev_key, &dummy_minor);
+            active_key(a, a->notes, a->count, i + 1, &next_key, &dummy_minor);
+            bool beamed = (i > 0 && can_beam(a, i - 1) && stem_down(prev_key, a->notes[i - 1]) == stem_down(current_key, a->notes[i])) ||
+                          (can_beam(a, i) && stem_down(current_key, a->notes[i]) == stem_down(next_key, a->notes[i + 1]));
+            draw_note(c, current_key, x, a->notes[i], i == a->selected, beamed);
             if(a->notes[i].repeat_start) {canvas_draw_line(c,x-9,19,x-9,47);canvas_draw_disc(c,x-5,30,1);canvas_draw_disc(c,x-5,37,1);}
             if(a->notes[i].repeat_end) {canvas_draw_line(c,x+8,19,x+8,47);canvas_draw_disc(c,x+4,30,1);canvas_draw_disc(c,x+4,37,1);}
-            if(a->notes[i].key_change) {canvas_draw_str(c,x-5,18,"K");}
+            if(a->notes[i].key_change) {
+                /* Indicate cancelled sharps/flats above the change boundary;
+                   full signature is shown in the header/staff for selection. */
+                int8_t old_key = i ? prev_key : a->fifths;
+                int cancelled = 0;
+                for(uint8_t letter = 0; letter < 7; ++letter) {
+                    if(key_alter(old_key, letter) && !key_alter(current_key, letter)) {
+                        /* Small cancellation naturals at the transition. */
+                        draw_accidental(c, x - 9 - cancelled * 5,
+                                        step_y(letter == 5 ? 3 : letter == 1 ? 6 : 5), 0);
+                        ++cancelled;
+                        if(cancelled == 2) break;
+                    }
+                }
+                canvas_draw_str(c,x-5,18,"K");
+            }
             if(previous_x >= 0 && !a->notes[i].rest && !a->notes[previous_i].rest) {
                 if(a->notes[previous_i].slur == 1 || a->notes[i].slur == 2) {
                     canvas_draw_line(c, previous_x, 13, (previous_x + x) / 2, 11);
@@ -459,7 +500,7 @@ static void draw_callback(Canvas* c, void* ctx) {
         canvas_draw_str(c, 2, 63, status);
     } else if(a->screen == ScreenAbout) {
         static const char* const help[][5] = {
-            {"Bard's Score v1.7", "Music notation for Flipper", "Created by Lachlan The Bard", "Up/Down: change page", "Back: return to tools"},
+            {"Bard's Score v1.7.1", "Music notation for Flipper", "Created by Lachlan The Bard", "Up/Down: change page", "Back: return to tools"},
             {"1/8 - Editing", "OK: add note", "Left/Right: select note", "Up/Down: semitone", "Back: delete; hold: exit"},
             {"2/8 - Note entry", "OK: choose pitch", "Up/Down: adjust pitch", "OK: choose duration", "OK: insert note"},
             {"3/8 - Score tools", "Hold OK: open tools", "Up/Down: choose action", "OK: apply action", "Back: return to score"},
@@ -505,11 +546,11 @@ static void input_callback(InputEvent* e, void* ctx) {
 }
 static bool file_write_text(File* f, const char* s) {size_t n = strlen(s); return storage_file_write(f, s, n) == n;}
 
-static bool write_xml_note(File* f, AppState* a, Note n, uint8_t voice, bool chord, uint8_t pitch) {
+static bool write_xml_note(File* f, int8_t fifths, Note n, uint8_t voice, bool chord, uint8_t pitch) {
     char b[768]; uint8_t ticks = note_ticks(n);
     if(n.rest) snprintf(b, sizeof(b), "<note><rest/><duration>%u</duration><voice>%u</voice><type>%s</type>%s</note>\n", ticks, voice, xml_types[n.duration], n.dotted ? "<dot/>" : "");
     else {
-        uint8_t letter; int alter; spell_pitch(a, pitch, &letter, &alter);
+        uint8_t letter; int alter; spell_pitch(fifths, pitch, &letter, &alter);
         int octave = ((int)pitch - (int)natural_pc[letter] - alter) / 12 - 1;
         snprintf(b, sizeof(b), "<note>%s<pitch><step>%s</step><alter>%d</alter><octave>%d</octave></pitch><duration>%u</duration><voice>%u</voice><type>%s</type>%s%s%s%s%s%s</note>\n",
             chord ? "<chord/>" : "", step_names[letter], alter, octave, ticks, voice, xml_types[n.duration], n.dotted ? "<dot/>" : "",
@@ -519,6 +560,13 @@ static bool write_xml_note(File* f, AppState* a, Note n, uint8_t voice, bool cho
             n.fermata ? "<notations><fermata/></notations>" : "",
             n.slur == 1 ? "<notations><slur number=\"1\" type=\"start\"/></notations>" : (n.slur == 2 ? "<notations><slur number=\"1\" type=\"stop\"/></notations>" : ""));
     }
+    return file_write_text(f, b);
+}
+
+static bool write_xml_key(File* f, int8_t fifths, bool minor) {
+    char b[128];
+    snprintf(b, sizeof(b), "<attributes><key><fifths>%d</fifths><mode>%s</mode></key></attributes>\n",
+             (int)fifths, minor ? "minor" : "major");
     return file_write_text(f, b);
 }
 
@@ -541,9 +589,12 @@ static bool write_xml_voice(File* f, AppState* a, Note* notes, uint16_t count, u
             Note n = notes[i];
             uint8_t ticks = note_ticks(n);
             if(position + ticks > limit && position != limit - cap) break;
-            ok = write_xml_note(f, a, n, voice, false, n.pitch);
+            int8_t key; bool minor;
+            active_key(a, notes, count, i, &key, &minor);
+            if(n.key_change) ok = write_xml_key(f, key, minor);
+            if(ok) ok = write_xml_note(f, key, n, voice, false, n.pitch);
             for(uint8_t k = 0; k < n.chord_count && ok; ++k)
-                ok = write_xml_note(f, a, n, voice, true, n.chord[k]);
+                ok = write_xml_note(f, key, n, voice, true, n.chord[k]);
             position += ticks; ++i;
         }
         ok = ok && file_write_text(f, "</measure>\n");
@@ -577,9 +628,12 @@ static bool write_xml_combined(File* f, AppState* a, Note* v1, uint16_t c1, Note
             while(idx[v] < counts[v] && used < cap && ok) {
                 Note n = voices[v][idx[v]]; uint32_t ticks = note_ticks(n);
                 if(used + ticks > cap && used != 0) break;
-                ok = write_xml_note(f, a, n, v + 1, false, n.pitch);
+                int8_t key; bool minor;
+                active_key(a, voices[v], counts[v], idx[v], &key, &minor);
+                if(n.key_change) ok = write_xml_key(f, key, minor);
+                if(ok) ok = write_xml_note(f, key, n, v + 1, false, n.pitch);
                 for(uint8_t k = 0; k < n.chord_count && ok; ++k)
-                    ok = write_xml_note(f, a, n, v + 1, true, n.chord[k]);
+                    ok = write_xml_note(f, key, n, v + 1, true, n.chord[k]);
                 used += ticks; ++idx[v];
             }
             pos[v] += used;
@@ -898,7 +952,7 @@ static void do_menu(AppState* a) {
     case 25: if(n) {n->dotted ^= 1; snprintf(a->notice,sizeof(a->notice),n->dotted ? "Dotted" : "Undotted");} break;
     case 26: if(n) {n->repeat_start ^= 1; snprintf(a->notice,sizeof(a->notice),"Repeat start toggled");} break;
     case 27: if(n) {n->repeat_end ^= 1; snprintf(a->notice,sizeof(a->notice),"Repeat end toggled");} break;
-    case 28: if(n) {a->inserting_key=true; a->edit_fifths=n->key_change?n->key_fifths:a->fifths; a->edit_minor=n->key_change?n->key_minor:a->minor; a->screen=ScreenKey; return;} break;
+    case 28: if(n) {a->inserting_key=true; active_key(a, a->notes, a->count, a->selected, &a->edit_fifths, &a->edit_minor); a->screen=ScreenKey; return;} break;
     case 29: if(n) {n->key_change=0; snprintf(a->notice,sizeof(a->notice),"Key change removed");} break;
     }
     a->screen = ScreenScore;
