@@ -660,11 +660,6 @@ static void input_callback(InputEvent* e, void* ctx) {
 
 static bool file_write_text(File* f, const char* s) {size_t n = strlen(s); return storage_file_write(f, s, n) == n;}
 
-static void str_cat(char* dst, size_t size, const char* src) {
-    size_t l = strlen(dst), sl = strlen(src);
-    if(l + sl + 1 <= size) memcpy(dst + l, src, sl + 1);
-}
-
 /* Element order follows the MusicXML schema: pitch, duration, tie, voice,
  * type, dot, then a single <notations> block. Chord tones carry no
  * ties, slurs or articulations of their own. Buffers are sized to the
