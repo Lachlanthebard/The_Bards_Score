@@ -16,10 +16,12 @@
 #define XML_TMP SCORE_DIR "/melody.musicxml.tmp"
 #define STAFF_BOTTOM 47
 #define STAFF_SPACING 7
-#define MENU_COUNT 31
+#define MENU_CAT_COUNT 11
+#define MARK_COUNT 12
+#define BARLINE_COUNT 7
 #define VISIBLE_NOTES 5
 
-/* Packed to 8 bytes (was 18). Two voices of 256 notes is 4 KB. */
+/* Packed to 9 bytes (was 18). Two voices of 256 notes is about 4.5 KB. */
 typedef struct {
     uint8_t pitch;
     uint8_t chord[3];
@@ -36,11 +38,17 @@ typedef struct {
     uint8_t repeat_end : 1;
     uint8_t key_change : 1;
     uint8_t key_minor : 1;
+    uint8_t tenuto : 1;
+    uint8_t staccatissimo : 1;
+    uint8_t marcato : 1;
+    uint8_t ornament : 3;   /* 0 none, 1 trill, 2 mordent, 3 inverted mordent, 4 turn */
+    uint8_t aftermark : 2;  /* 0 none, 1 breath mark, 2 caesura */
+    uint8_t barline : 3;    /* style of the barline ending this note's measure */
     int8_t key_fifths;
 } Note;
 _Static_assert(sizeof(Note) <= 10, "Note must stay packed");
 
-typedef enum {ScreenScore, ScreenPitch, ScreenDuration, ScreenMenu, ScreenTime, ScreenTempo, ScreenKey, ScreenAbout} Screen;
+typedef enum {ScreenScore, ScreenPitch, ScreenDuration, ScreenMenu, ScreenTime, ScreenTempo, ScreenKey, ScreenAbout, ScreenBarline, ScreenSubmenu} Screen;
 
 typedef struct {
     FuriMutex* mutex;
@@ -78,21 +86,16 @@ typedef struct {
     bool play_single;
     uint32_t chord_last;
     uint16_t chord_cycle;
+    bool paused, resume_sound;
+    uint32_t pause_tick;
+    uint32_t note_start_tick;
+    int8_t orn_off;
+    uint8_t menu_cat, sub, sub_top, barline_choice;
 } AppState;
 
 static const char* const durations[] = {"Whole", "Half", "Quarter", "Eighth", "16th"};
 static const char* const pitch_names[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
 static const char* const xml_types[] = {"whole", "half", "quarter", "eighth", "16th"};
-static const char* const menu_items[MENU_COUNT] = {
-    "Add rest", "Time signature", "Key signature", "Slur start", "Slur end",
-    "Tie start", "Tie end", "Staccato", "Accent", "Fermata",
-    "Save score", "Load score", "Export XML", "Clear score",
-    "Play score", "Play from here", "Preview note", "Set tempo",
-    "Switch voice", "Combined/solo view", "Add chord tone", "Remove chord tone",
-    "XML staff layout", "Play both voices", "About / Help",
-    "Toggle dotted", "Repeat start", "Repeat end", "Insert key change", "Remove key change",
-    "Undo delete"
-};
 static const uint8_t time_beats[] = {2, 3, 4, 6};
 static const uint8_t time_denoms[] = {4, 4, 4, 8};
 static const char* const major_names[] = {
@@ -109,6 +112,142 @@ static const uint8_t flat_letters[] = {6, 2, 5, 1, 4, 0, 3};
 static const char* const step_names[] = {"C", "D", "E", "F", "G", "A", "B"};
 static const uint8_t natural_pc[] = {0, 2, 4, 5, 7, 9, 11};
 static const uint8_t degree_pc[] = {0, 0, 1, 1, 2, 3, 3, 4, 4, 5, 5, 6};
+
+static const char* const barline_names[BARLINE_COUNT] = {
+    "Single (auto)", "Double", "Final", "Dashed", "Dotted", "Heavy", "Invisible"
+};
+static const char* const xml_bar_styles[BARLINE_COUNT] = {
+    "regular", "light-light", "light-heavy", "dashed", "dotted", "heavy", "none"
+};
+static const char* const mark_names[MARK_COUNT] = {
+    "Staccato", "Accent", "Tenuto", "Staccatissimo", "Marcato", "Fermata",
+    "Trill", "Mordent", "Inv. mordent", "Turn", "Breath mark", "Caesura"
+};
+
+static bool mark_get(const Note* n, uint8_t m) {
+    switch(m) {
+    case 0: return n->staccato;
+    case 1: return n->accent;
+    case 2: return n->tenuto;
+    case 3: return n->staccatissimo;
+    case 4: return n->marcato;
+    case 5: return n->fermata;
+    case 6: return n->ornament == 1;
+    case 7: return n->ornament == 2;
+    case 8: return n->ornament == 3;
+    case 9: return n->ornament == 4;
+    case 10: return n->aftermark == 1;
+    default: return n->aftermark == 2;
+    }
+}
+
+/* Ornaments are mutually exclusive, as are breath mark and caesura. */
+static void mark_toggle(Note* n, uint8_t m) {
+    switch(m) {
+    case 0: n->staccato ^= 1; break;
+    case 1: n->accent ^= 1; break;
+    case 2: n->tenuto ^= 1; break;
+    case 3: n->staccatissimo ^= 1; break;
+    case 4: n->marcato ^= 1; break;
+    case 5: n->fermata ^= 1; break;
+    case 6: n->ornament = n->ornament == 1 ? 0 : 1; break;
+    case 7: n->ornament = n->ornament == 2 ? 0 : 2; break;
+    case 8: n->ornament = n->ornament == 3 ? 0 : 3; break;
+    case 9: n->ornament = n->ornament == 4 ? 0 : 4; break;
+    case 10: n->aftermark = n->aftermark == 1 ? 0 : 1; break;
+    default: n->aftermark = n->aftermark == 2 ? 0 : 2; break;
+    }
+}
+
+/* ---- Score tools menu -------------------------------------------------
+ * Two levels, like a notation palette: a list of categories, each opening
+ * a list of entries. An entry is either an action id (below ActCount) or
+ * a note mark (ActCount + mark index). Entries that are on/off settings
+ * show a checkbox and keep the submenu open so several can be set in a row. */
+typedef enum {
+    ActAddRest, ActTime, ActKey, ActSlurStart, ActSlurEnd, ActTieStart, ActTieEnd,
+    ActSave, ActLoad, ActExport, ActClear,
+    ActPlay, ActPlayFrom, ActPreview, ActTempo,
+    ActVoice, ActCombined, ActChordAdd, ActChordRemove, ActXmlLayout, ActPlayBoth,
+    ActHelp, ActDotted, ActRepeatStart, ActRepeatEnd, ActKeyChange, ActKeyRemove,
+    ActUndo, ActBarline,
+    ActCount
+} MenuAction;
+
+#define MARK_ENTRY(m) ((uint8_t)(ActCount + (m)))
+
+static const char* const action_names[ActCount] = {
+    [ActAddRest] = "Add rest", [ActTime] = "Time signature", [ActKey] = "Key signature",
+    [ActSlurStart] = "Slur start", [ActSlurEnd] = "Slur end",
+    [ActTieStart] = "Tie start", [ActTieEnd] = "Tie end",
+    [ActSave] = "Save score", [ActLoad] = "Load score", [ActExport] = "Export XML",
+    [ActClear] = "Clear score",
+    [ActPlay] = "Play score", [ActPlayFrom] = "Play from here",
+    [ActPreview] = "Preview note", [ActTempo] = "Set tempo",
+    [ActVoice] = "Switch voice", [ActCombined] = "Combined view",
+    [ActChordAdd] = "Add chord tone", [ActChordRemove] = "Remove chord tone",
+    [ActXmlLayout] = "XML: 2 staves", [ActPlayBoth] = "Play both voices",
+    [ActHelp] = "About / Help", [ActDotted] = "Dotted note",
+    [ActRepeatStart] = "Repeat start", [ActRepeatEnd] = "Repeat end",
+    [ActKeyChange] = "Insert key change", [ActKeyRemove] = "Remove key change",
+    [ActUndo] = "Undo delete", [ActBarline] = "Barline style",
+};
+
+static const uint8_t cat_notes[] = {ActAddRest, ActDotted, ActChordAdd, ActChordRemove, ActUndo};
+static const uint8_t cat_keytime[] = {ActTime, ActKey, ActKeyChange, ActKeyRemove};
+static const uint8_t cat_barlines[] = {ActBarline, ActRepeatStart, ActRepeatEnd};
+static const uint8_t cat_slurs[] = {ActSlurStart, ActSlurEnd, ActTieStart, ActTieEnd};
+static const uint8_t cat_artic[] = {MARK_ENTRY(0), MARK_ENTRY(1), MARK_ENTRY(2), MARK_ENTRY(3), MARK_ENTRY(4)};
+static const uint8_t cat_orn[] = {MARK_ENTRY(6), MARK_ENTRY(7), MARK_ENTRY(8), MARK_ENTRY(9)};
+static const uint8_t cat_breath[] = {MARK_ENTRY(5), MARK_ENTRY(10), MARK_ENTRY(11)};
+static const uint8_t cat_voices[] = {ActVoice, ActCombined};
+static const uint8_t cat_play[] = {ActPlay, ActPlayFrom, ActPreview, ActPlayBoth, ActTempo};
+static const uint8_t cat_file[] = {ActSave, ActLoad, ActExport, ActXmlLayout, ActClear};
+static const uint8_t cat_help[] = {ActHelp};
+
+typedef struct {
+    const char* name;
+    const uint8_t* items;
+    uint8_t count;
+} MenuCat;
+
+#define CAT(label, arr) {label, arr, (uint8_t)(sizeof(arr) / sizeof((arr)[0]))}
+/* A category with a single entry runs it directly (Help). */
+static const MenuCat menu_cats[MENU_CAT_COUNT] = {
+    CAT("Notes", cat_notes),
+    CAT("Key & time", cat_keytime),
+    CAT("Barlines", cat_barlines),
+    CAT("Slurs & ties", cat_slurs),
+    CAT("Articulations", cat_artic),
+    CAT("Ornaments", cat_orn),
+    CAT("Breaths & pauses", cat_breath),
+    CAT("Voices", cat_voices),
+    CAT("Playback", cat_play),
+    CAT("File", cat_file),
+    CAT("Help", cat_help),
+};
+
+static const char* entry_name(uint8_t e) {
+    return e >= ActCount ? mark_names[e - ActCount] : action_names[e];
+}
+
+/* -1: plain action (no checkbox). 0/1: on/off setting for the selection. */
+static int entry_state(const AppState* a, uint8_t e) {
+    const Note* n = a->count ? &a->notes[a->selected] : NULL;
+    if(e >= ActCount) return (n && mark_get(n, e - ActCount)) ? 1 : 0;
+    switch(e) {
+    case ActSlurStart: return (n && n->slur == 1) ? 1 : 0;
+    case ActSlurEnd: return (n && n->slur == 2) ? 1 : 0;
+    case ActTieStart: return (n && n->tie == 1) ? 1 : 0;
+    case ActTieEnd: return (n && n->tie == 2) ? 1 : 0;
+    case ActDotted: return (n && n->dotted) ? 1 : 0;
+    case ActRepeatStart: return (n && n->repeat_start) ? 1 : 0;
+    case ActRepeatEnd: return (n && n->repeat_end) ? 1 : 0;
+    case ActCombined: return a->combined ? 1 : 0;
+    case ActXmlLayout: return a->separate_staves ? 1 : 0;
+    default: return -1;
+    }
+}
 
 static uint8_t duration_ticks(uint8_t d) {return (uint8_t)(32U >> d);}
 static uint8_t note_ticks(Note n) {uint8_t t = duration_ticks(n.duration); return n.dotted ? t + t / 2 : t;}
@@ -253,6 +392,36 @@ static void draw_rest(Canvas* c, int x, uint8_t d) {
     }
 }
 
+/* Barline styles: 0 single, 1 double, 2 final, 3 dashed, 4 dotted,
+ * 5 heavy, 6 invisible. x is the centre of the line. */
+static void draw_barline(Canvas* c, int x, uint8_t style) {
+    switch(style) {
+    case 1:
+        canvas_draw_line(c, x - 1, 19, x - 1, STAFF_BOTTOM);
+        canvas_draw_line(c, x + 2, 19, x + 2, STAFF_BOTTOM);
+        break;
+    case 2:
+        canvas_draw_line(c, x - 2, 19, x - 2, STAFF_BOTTOM);
+        canvas_draw_box(c, x + 1, 19, 3, STAFF_BOTTOM - 19 + 1);
+        break;
+    case 3:
+        for(int y = 19; y <= STAFF_BOTTOM; y += 4)
+            canvas_draw_line(c, x, y, x, y + 1 > STAFF_BOTTOM ? STAFF_BOTTOM : y + 1);
+        break;
+    case 4:
+        for(int y = 19; y <= STAFF_BOTTOM; y += 3) canvas_draw_dot(c, x, y);
+        break;
+    case 5:
+        canvas_draw_box(c, x - 1, 19, 3, STAFF_BOTTOM - 19 + 1);
+        break;
+    case 6:
+        break;
+    default:
+        canvas_draw_line(c, x, 19, x, STAFF_BOTTOM);
+        break;
+    }
+}
+
 static int stem_end(int8_t fifths, Note n, bool down) {
     uint8_t letter; int alter;
     spell_pitch(fifths, n.pitch, &letter, &alter);
@@ -319,20 +488,67 @@ static void draw_note(Canvas* c, int8_t fifths, int x, Note n, bool selected, bo
         canvas_set_color(c, ColorBlack);
         canvas_draw_box(c, x - 1, dot_y - 1, 2, 2);
     }
+    /* Marks above the note are stacked upward, nearest first, so several
+     * can be combined without overlapping. */
+    int up = (n.staccato && y >= 28) ? 14 : 9;
     if(n.accent) {
-        canvas_draw_line(c, x - 4, y - 9, x + 2, y - 11);
-        canvas_draw_line(c, x + 2, y - 11, x - 4, y - 13);
+        canvas_draw_line(c, x - 4, y - up, x + 2, y - up - 2);
+        canvas_draw_line(c, x + 2, y - up - 2, x - 4, y - up - 4);
+        up += 6;
     }
-    /* Fermata: open arch over a separate dot. Moved further out when
-     * the note also carries an accent. */
+    if(n.marcato) {
+        canvas_draw_line(c, x - 3, y - up, x, y - up - 4);
+        canvas_draw_line(c, x, y - up - 4, x + 3, y - up);
+        up += 7;
+    }
+    if(n.tenuto) {
+        canvas_draw_line(c, x - 3, y - up - 1, x + 3, y - up - 1);
+        up += 4;
+    }
+    if(n.staccatissimo) {
+        canvas_draw_line(c, x - 1, y - up - 4, x, y - up);
+        canvas_draw_line(c, x + 1, y - up - 4, x, y - up);
+        canvas_draw_line(c, x, y - up - 4, x, y - up);
+        up += 6;
+    }
+    if(n.ornament) {
+        int yb = y - up;
+        if(n.ornament == 1) {
+            canvas_draw_str(c, x - 5, yb, "tr");
+        } else if(n.ornament == 4) {
+            canvas_draw_line(c, x - 4, yb - 1, x - 3, yb - 4);
+            canvas_draw_line(c, x - 3, yb - 4, x - 1, yb - 4);
+            canvas_draw_line(c, x - 1, yb - 4, x + 1, yb - 1);
+            canvas_draw_line(c, x + 1, yb - 1, x + 3, yb);
+            canvas_draw_line(c, x + 3, yb, x + 4, yb - 1);
+        } else {
+            /* Zigzag; the mordent (2) also has a vertical stroke. */
+            canvas_draw_line(c, x - 4, yb, x - 2, yb - 3);
+            canvas_draw_line(c, x - 2, yb - 3, x, yb);
+            canvas_draw_line(c, x, yb, x + 2, yb - 3);
+            canvas_draw_line(c, x + 2, yb - 3, x + 4, yb);
+            if(n.ornament == 2) canvas_draw_line(c, x, yb - 4, x, yb + 1);
+        }
+        up += 8;
+    }
+    /* Fermata: open arch over a separate dot, above everything else. */
     if(n.fermata) {
-        int fy = y - (n.accent ? 23 : 17);
+        int fy = y - up - 3;
         canvas_draw_line(c, x - 6, fy + 2, x - 5, fy - 1);
         canvas_draw_line(c, x - 5, fy - 1, x - 2, fy - 3);
         canvas_draw_line(c, x - 2, fy - 3, x + 2, fy - 3);
         canvas_draw_line(c, x + 2, fy - 3, x + 5, fy - 1);
         canvas_draw_line(c, x + 5, fy - 1, x + 6, fy + 2);
         canvas_draw_box(c, x, fy, 2, 2);
+    }
+    /* Breath mark (comma) and caesura (double slash) sit after the note,
+     * just above the staff. */
+    if(n.aftermark == 1) {
+        canvas_draw_dot(c, x + 9, 15);
+        canvas_draw_line(c, x + 9, 15, x + 8, 18);
+    } else if(n.aftermark == 2) {
+        canvas_draw_line(c, x + 8, 22, x + 10, 14);
+        canvas_draw_line(c, x + 11, 22, x + 13, 14);
     }
     if(selected) canvas_draw_frame(c, x - 5, y - 5, 11, 11);
 }
@@ -349,6 +565,25 @@ static uint8_t tick_before(const AppState* a, uint16_t index) {
 }
 
 static uint8_t group_ticks(const AppState* a) {return a->beat_type == 8 ? 12 : 8;}
+
+/* True if a barline falls after note i of the active voice: the measure
+ * fills, the next note would overflow it, or it is the last note. */
+static bool measure_ends_after(const AppState* a, uint16_t i) {
+    if(i >= a->count) return false;
+    if(i + 1 >= a->count) return true;
+    uint8_t cap = measure_ticks(a), used = tick_before(a, i);
+    uint8_t t = note_ticks(a->notes[i]);
+    if(used && used + t > cap) used = 0;
+    used += t;
+    if(used >= cap) return true;
+    uint8_t next = note_ticks(a->notes[i + 1]);
+    return used && used + next > cap;
+}
+
+static uint16_t measure_last_index(const AppState* a, uint16_t i) {
+    while(i + 1 < a->count && !measure_ends_after(a, i)) ++i;
+    return i;
+}
 
 static bool can_beam(const AppState* a, uint16_t left) {
     if(left + 1 >= a->count) return false;
@@ -419,7 +654,7 @@ static void draw_combined_events(Canvas* c, AppState* a, int x0, uint8_t visible
         bool has2 = j < a->other_count && t2 == t;
         if(slot >= first) {
             int x = x0 + shown * 16;
-            if(t && t % cap == 0) canvas_draw_line(c, x - 8, 19, x - 8, STAFF_BOTTOM);
+            if(t && t % cap == 0) draw_barline(c, x - 8, (has1 && i > 0) ? a->notes[i - 1].barline : 0);
             int8_t k1, k2; bool m1, m2;
             active_key(a, a->notes, a->count, i, &k1, &m1);
             active_key(a, a->other_notes, a->other_count, j, &k2, &m2);
@@ -467,7 +702,7 @@ static void draw_callback(Canvas* c, void* ctx) {
             for(uint16_t i = start; i < end; ++i) {
                 int x = x0 + (i - start) * spacing;
                 uint8_t ticks = note_ticks(a->notes[i]);
-                if(used && used + ticks > cap) {canvas_draw_line(c, x - 8, 19, x - 8, STAFF_BOTTOM); used = 0;}
+                if(used && used + ticks > cap) {draw_barline(c, x - 8, i ? a->notes[i - 1].barline : 0); used = 0;}
                 int8_t current_key, prev_key, next_key; bool current_minor, dummy_minor;
                 active_key(a, a->notes, a->count, i, &current_key, &current_minor);
                 active_key(a, a->notes, a->count, i ? i - 1 : 0, &prev_key, &dummy_minor);
@@ -504,14 +739,20 @@ static void draw_callback(Canvas* c, void* ctx) {
                 }
                 previous_x = x; previous_y = note_y(a->notes[i].pitch); previous_i = i;
                 used += ticks;
-                if(used >= cap) {if(i + 1 < end) canvas_draw_line(c, x + 8, 19, x + 8, STAFF_BOTTOM); used = 0;}
+                bool bar_after = used >= cap;
+                if(bar_after) used = 0;
+                if(i + 1 == a->count) {
+                    if(a->notes[i].barline) draw_barline(c, x + 8, a->notes[i].barline);
+                } else if(bar_after && i + 1 < end) {
+                    draw_barline(c, x + 8, a->notes[i].barline);
+                }
             }
             draw_beams(c, a, start, end, x0, spacing);
         }
         canvas_set_font(c, FontSecondary);
         char status[42];
-        if(a->playing && a->play_both) snprintf(status, sizeof(status), "Playing both Back:Stop");
-        else if(a->playing) snprintf(status, sizeof(status), "Playing %u/%u Back:Stop", (unsigned)(a->play_index + 1), (unsigned)a->count);
+        if(a->playing && a->paused) snprintf(status, sizeof(status), "OK:Resume Back:Stop");
+        else if(a->playing) snprintf(status, sizeof(status), "OK:Pause Back:Stop");
         else if(a->notice[0]) snprintf(status, sizeof(status), "%s", a->notice);
         else if(a->count) {
             Note n = a->notes[a->selected]; char label[8];
@@ -522,15 +763,15 @@ static void draw_callback(Canvas* c, void* ctx) {
     } else if(a->screen == ScreenAbout) {
         /* Lines are kept to 22 characters or fewer so they fit 128 px. */
         static const char* const help[][5] = {
-            {"Bard's Score v1.9", "Notation for Flipper", "By Lachlan The Bard", "Up/Down: change page", "Back: return to tools"},
+            {"Bard's Score v2.1", "Notation for Flipper", "By Lachlan The Bard", "Up/Down: change page", "Back: return to tools"},
             {"1/8 - Editing", "OK: add note", "L/R: select note", "Up/Down: semitone", "Back del, hold: exit"},
             {"2/8 - Note entry", "OK: choose pitch", "Up/Down: adjust pitch", "OK: choose duration", "OK: insert note"},
-            {"3/8 - Score tools", "Hold OK: open tools", "Up/Down: choose action", "OK: apply action", "Back: return to score"},
-            {"4/8 - Notation", "Rests, time, keys", "Slurs, ties, accents", "Repeats, dotted notes", "Tempo in Score tools"},
+            {"3/8 - Score tools", "Hold OK: open tools", "Up/Down: pick category", "OK: open / apply", "Back: up one level"},
+            {"4/8 - Notation", "Rests, time, keys", "Marks and ornaments", "Barline styles", "Repeats, dots, slurs"},
             {"5/8 - Chords", "Select a note first", "Tools > Add chord tone", "Pick pitch, press OK", "Up to 4 pitches"},
             {"6/8 - Voices", "Tools > Switch voice", "Edit each voice alone", "Combined/solo toggle", "Play both in tools"},
             {"7/8 - Files / XML", "Tools: Save/Load/XML", "BSC5 native format", "XML: 1 or 2 staves", "Back up melody.bsc"},
-            {"8/8 - Playback", "Play all or from here", "Preview selected note", "Back: stop playback", "Chords are arpeggiated"},
+            {"8/8 - Playback", "Play all or from here", "OK: pause / resume", "Back stop, hold: exit", "Chords are arpeggiated"},
         };
         uint8_t page = a->about_page;
         canvas_draw_str(c, 2, 11, help[page][0]);
@@ -539,10 +780,35 @@ static void draw_callback(Canvas* c, void* ctx) {
     } else if(a->screen == ScreenMenu) {
         canvas_draw_str(c, 2, 11, "Score tools");
         canvas_set_font(c, FontSecondary);
-        for(uint8_t i = a->menu_top; i < MENU_COUNT && i < a->menu_top + 4; ++i) {
-            char line[28]; snprintf(line, sizeof(line), "%c %s", a->menu == i ? '>' : ' ', menu_items[i]);
+        char pos[12];
+        snprintf(pos, sizeof(pos), "%u/%u", (unsigned)a->menu + 1, (unsigned)MENU_CAT_COUNT);
+        canvas_draw_str(c, 98, 11, pos);
+        for(uint8_t i = a->menu_top; i < MENU_CAT_COUNT && i < a->menu_top + 4; ++i) {
+            char line[28];
+            snprintf(line, sizeof(line), "%c %s", a->menu == i ? '>' : ' ', menu_cats[i].name);
             canvas_draw_str(c, 3, 23 + (i - a->menu_top) * 12, line);
         }
+    } else if(a->screen == ScreenSubmenu) {
+        const MenuCat* cat = &menu_cats[a->menu_cat];
+        canvas_draw_str(c, 2, 11, cat->name);
+        canvas_set_font(c, FontSecondary);
+        char pos[12];
+        snprintf(pos, sizeof(pos), "%u/%u", (unsigned)a->sub + 1, (unsigned)cat->count);
+        canvas_draw_str(c, 98, 11, pos);
+        for(uint8_t i = a->sub_top; i < cat->count && i < a->sub_top + 4; ++i) {
+            uint8_t e = cat->items[i];
+            int st = entry_state(a, e);
+            char line[32];
+            snprintf(line, sizeof(line), "%c %s%s", a->sub == i ? '>' : ' ',
+                st < 0 ? "" : (st ? "[x] " : "[ ] "), entry_name(e));
+            canvas_draw_str(c, 3, 23 + (i - a->sub_top) * 12, line);
+        }
+    } else if(a->screen == ScreenBarline) {
+        canvas_draw_str(c, 2, 11, "Barline style");
+        canvas_set_font(c, FontSecondary);
+        canvas_draw_str(c, 8, 33, barline_names[a->barline_choice % BARLINE_COUNT]);
+        canvas_draw_str(c, 2, 61, "Up/Down OK:Set");
+        draw_barline(c, 112, a->barline_choice);
     } else {
         const char* title = a->screen == ScreenPitch ? (a->chord_edit ? "Add chord pitch" : "Choose pitch") :
             a->screen == ScreenDuration ? (a->adding_rest ? "Rest length" : "Note length") :
@@ -570,18 +836,16 @@ static void input_callback(InputEvent* e, void* ctx) {
 
 static bool file_write_text(File* f, const char* s) {size_t n = strlen(s); return storage_file_write(f, s, n) == n;}
 
-static void str_cat(char* dst, size_t size, const char* src) {
-    size_t l = strlen(dst), sl = strlen(src);
-    if(l + sl + 1 <= size) memcpy(dst + l, src, sl + 1);
+static bool xw(File* f, bool ok, bool cond, const char* text) {
+    return ok && (!cond || file_write_text(f, text));
 }
 
 /* Element order follows the MusicXML schema: pitch, duration, tie, voice,
  * type, dot, then a single <notations> block. Chord tones carry no
- * ties, slurs or articulations of their own. Buffers are sized to the
- * longest possible output (about 162 and 134 bytes) to keep stack small. */
+ * ties, slurs, ornaments or articulations of their own. The notations
+ * are written piece by piece so no large buffer is needed on the stack. */
 static bool write_xml_note(File* f, int8_t fifths, Note n, uint8_t voice, bool chord, uint8_t pitch) {
     char b[200];
-    char nt[144];
     uint8_t ticks = note_ticks(n);
     if(n.rest) {
         snprintf(b, sizeof(b), "<note><rest/><duration>%u</duration><voice>%u</voice><type>%s</type>%s</note>\n",
@@ -598,25 +862,33 @@ static bool write_xml_note(File* f, int8_t fifths, Note n, uint8_t voice, bool c
         chord ? "<chord/>" : "", step_names[letter], alter, octave, ticks,
         tie_stop ? "<tie type=\"stop\"/>" : "", tie_start ? "<tie type=\"start\"/>" : "",
         voice, xml_types[n.duration], n.dotted ? "<dot/>" : "");
-    nt[0] = '\0';
-    if(!chord && (n.tie || n.slur || n.staccato || n.accent || n.fermata)) {
-        str_cat(nt, sizeof(nt), "<notations>");
-        if(n.tie == 1) str_cat(nt, sizeof(nt), "<tied type=\"start\"/>");
-        if(n.tie == 2) str_cat(nt, sizeof(nt), "<tied type=\"stop\"/>");
-        if(n.slur == 1) str_cat(nt, sizeof(nt), "<slur number=\"1\" type=\"start\"/>");
-        if(n.slur == 2) str_cat(nt, sizeof(nt), "<slur number=\"1\" type=\"stop\"/>");
-        if(n.staccato || n.accent) {
-            str_cat(nt, sizeof(nt), "<articulations>");
-            if(n.staccato) str_cat(nt, sizeof(nt), "<staccato/>");
-            if(n.accent) str_cat(nt, sizeof(nt), "<accent/>");
-            str_cat(nt, sizeof(nt), "</articulations>");
-        }
-        if(n.fermata) str_cat(nt, sizeof(nt), "<fermata/>");
-        str_cat(nt, sizeof(nt), "</notations>");
-    }
     bool ok = file_write_text(f, b);
-    if(ok && nt[0]) ok = file_write_text(f, nt);
-    if(ok) ok = file_write_text(f, "</note>\n");
+    bool nc = !chord;
+    bool art = n.staccato || n.accent || n.tenuto || n.staccatissimo || n.marcato || n.aftermark;
+    bool any = nc && (n.tie || n.slur || n.ornament || art || n.fermata);
+    ok = xw(f, ok, any, "<notations>");
+    ok = xw(f, ok, nc && n.tie == 1, "<tied type=\"start\"/>");
+    ok = xw(f, ok, nc && n.tie == 2, "<tied type=\"stop\"/>");
+    ok = xw(f, ok, nc && n.slur == 1, "<slur number=\"1\" type=\"start\"/>");
+    ok = xw(f, ok, nc && n.slur == 2, "<slur number=\"1\" type=\"stop\"/>");
+    ok = xw(f, ok, nc && n.ornament, "<ornaments>");
+    ok = xw(f, ok, nc && n.ornament == 1, "<trill-mark/>");
+    ok = xw(f, ok, nc && n.ornament == 2, "<mordent/>");
+    ok = xw(f, ok, nc && n.ornament == 3, "<inverted-mordent/>");
+    ok = xw(f, ok, nc && n.ornament == 4, "<turn/>");
+    ok = xw(f, ok, nc && n.ornament, "</ornaments>");
+    ok = xw(f, ok, nc && art, "<articulations>");
+    ok = xw(f, ok, nc && n.accent, "<accent/>");
+    ok = xw(f, ok, nc && n.marcato, "<strong-accent/>");
+    ok = xw(f, ok, nc && n.staccato, "<staccato/>");
+    ok = xw(f, ok, nc && n.tenuto, "<tenuto/>");
+    ok = xw(f, ok, nc && n.staccatissimo, "<staccatissimo/>");
+    ok = xw(f, ok, nc && n.aftermark == 1, "<breath-mark/>");
+    ok = xw(f, ok, nc && n.aftermark == 2, "<caesura/>");
+    ok = xw(f, ok, nc && art, "</articulations>");
+    ok = xw(f, ok, nc && n.fermata, "<fermata/>");
+    ok = xw(f, ok, any, "</notations>");
+    ok = xw(f, ok, true, "</note>\n");
     return ok;
 }
 
@@ -629,6 +901,20 @@ static bool write_xml_key(File* f, int8_t fifths, bool minor) {
 
 /* Shared by both XML layouts. The buffer is only live while this runs,
  * never at the same time as the note buffers. */
+/* Left barline carries a forward repeat; right barline carries the style
+ * and/or a backward repeat. Plain single barlines are left implicit. */
+static bool write_xml_barline(File* f, bool left, uint8_t style, bool repeat) {
+    if(!repeat && style == 0) return true;
+    const char* bs = repeat ? (left ? "heavy-light" : "light-heavy") : xml_bar_styles[style % BARLINE_COUNT];
+    bool ok = file_write_text(f, left ? "<barline location=\"left\">" : "<barline location=\"right\">");
+    ok = xw(f, ok, true, "<bar-style>");
+    ok = xw(f, ok, true, bs);
+    ok = xw(f, ok, true, "</bar-style>");
+    ok = xw(f, ok, repeat, left ? "<repeat direction=\"forward\"/>" : "<repeat direction=\"backward\"/>");
+    ok = xw(f, ok, true, "</barline>\n");
+    return ok;
+}
+
 static bool write_xml_attributes(File* f, const AppState* a) {
     char b[208];
     snprintf(b, sizeof(b), "<attributes><divisions>8</divisions><key><fifths>%d</fifths><mode>%s</mode></key><time><beats>%u</beats><beat-type>%u</beat-type></time><clef><sign>G</sign><line>2</line></clef></attributes>\n", (int)a->fifths, a->minor ? "minor" : "major", a->beats, a->beat_type);
@@ -644,13 +930,24 @@ static bool write_xml_voice(File* f, AppState* a, Note* notes, uint16_t count, u
     uint16_t i = 0;
     while((i < count || (attributes && measure == 1)) && ok) {
         snprintf(b, sizeof(b), "<measure number=\"%u\">\n", measure++);
+        uint32_t limit = (uint32_t)(measure - 1) * cap;
+        /* Dry run: which notes land in this measure, and do they carry repeats? */
+        uint16_t first = i, j = i;
+        uint32_t pos = position;
+        bool rs = false, re = false;
+        while(j < count && pos < limit) {
+            uint8_t t = note_ticks(notes[j]);
+            if(pos + t > limit && pos != limit - cap) break;
+            if(notes[j].repeat_start) rs = true;
+            if(notes[j].repeat_end) re = true;
+            pos += t; ++j;
+        }
         ok = file_write_text(f, b);
         if(attributes && measure == 2 && ok) ok = write_xml_attributes(f, a);
-        uint32_t limit = (uint32_t)(measure - 1) * cap;
-        while(i < count && position < limit && ok) {
+        if(ok) ok = write_xml_barline(f, true, 0, rs);
+        while(i < j && ok) {
             Note n = notes[i];
             uint8_t ticks = note_ticks(n);
-            if(position + ticks > limit && position != limit - cap) break;
             int8_t key; bool minor;
             active_key(a, notes, count, i, &key, &minor);
             if(n.key_change) ok = write_xml_key(f, key, minor);
@@ -659,6 +956,7 @@ static bool write_xml_voice(File* f, AppState* a, Note* notes, uint16_t count, u
                 ok = write_xml_note(f, key, n, voice, true, n.chord[k]);
             position += ticks; ++i;
         }
+        if(ok) ok = write_xml_barline(f, false, j > first ? notes[j - 1].barline : 0, re);
         ok = ok && file_write_text(f, "</measure>\n");
         /* A note that does not fit moves to the next measure. */
         if(i < count && position < limit) position = limit;
@@ -666,9 +964,23 @@ static bool write_xml_voice(File* f, AppState* a, Note* notes, uint16_t count, u
     return ok;
 }
 
+/* Notes that fit in one measure of a voice, starting at `from`. */
+static uint16_t measure_span(const Note* notes, uint16_t from, uint16_t count, uint32_t cap, uint32_t* used_out) {
+    uint32_t used = 0;
+    uint16_t j = from;
+    while(j < count && used < cap) {
+        uint32_t t = note_ticks(notes[j]);
+        if(used + t > cap && used != 0) break;
+        used += t; ++j;
+    }
+    *used_out = used;
+    return j;
+}
+
 /* One-staff MusicXML: two independent voices use <backup> per measure.
  * Measures keep being written until BOTH voices are fully consumed, so
- * notes pushed into later measures are never dropped. */
+ * notes pushed into later measures are never dropped. Barline style and
+ * repeats are taken from voice 1 first, then voice 2. */
 static bool write_xml_combined(File* f, AppState* a, Note* v1, uint16_t c1, Note* v2, uint16_t c2) {
     uint16_t idx[2] = {0, 0};
     Note* voices[2] = {v1, v2};
@@ -680,35 +992,46 @@ static bool write_xml_combined(File* f, AppState* a, Note* v1, uint16_t c1, Note
         snprintf(b, sizeof(b), "<measure number=\"%lu\">\n", (unsigned long)(measure + 1));
         ok = file_write_text(f, b);
         if(measure == 0 && ok) ok = write_xml_attributes(f, a);
+        uint32_t used[2] = {0, 0};
+        uint16_t end[2] = {0, 0};
+        bool rs = false, re = false;
+        uint8_t style = 0;
+        for(uint8_t v = 0; v < 2; ++v) {
+            end[v] = measure_span(voices[v], idx[v], counts[v], cap, &used[v]);
+            for(uint16_t k = idx[v]; k < end[v]; ++k) {
+                if(voices[v][k].repeat_start) rs = true;
+                if(voices[v][k].repeat_end) re = true;
+            }
+            if(end[v] > idx[v] && (v == 0 || style == 0)) style = voices[v][end[v] - 1].barline;
+        }
+        if(ok) ok = write_xml_barline(f, true, 0, rs);
         for(uint8_t v = 0; v < 2 && ok; ++v) {
-            uint32_t used = 0;
-            while(idx[v] < counts[v] && used < cap && ok) {
+            while(idx[v] < end[v] && ok) {
                 Note n = voices[v][idx[v]];
-                uint32_t ticks = note_ticks(n);
-                if(used + ticks > cap && used != 0) break;
                 int8_t key; bool minor;
                 active_key(a, voices[v], counts[v], idx[v], &key, &minor);
                 if(n.key_change) ok = write_xml_key(f, key, minor);
                 if(ok) ok = write_xml_note(f, key, n, v + 1, false, n.pitch);
                 for(uint8_t k = 0; k < n.chord_count && ok; ++k)
                     ok = write_xml_note(f, key, n, v + 1, true, n.chord[k]);
-                used += ticks; ++idx[v];
+                ++idx[v];
             }
-            if(v == 0 && ok && used) {
-                snprintf(b, sizeof(b), "<backup><duration>%lu</duration></backup>\n", (unsigned long)used);
+            if(v == 0 && ok && used[0]) {
+                snprintf(b, sizeof(b), "<backup><duration>%lu</duration></backup>\n", (unsigned long)used[0]);
                 ok = file_write_text(f, b);
             }
         }
+        if(ok) ok = write_xml_barline(f, false, style, re);
         if(ok) ok = file_write_text(f, "</measure>\n");
     }
     return ok;
 }
 
-/* Native BSC5 writer, split out so its line buffer is not on the stack
+/* Native BSC6 writer, split out so its line buffer is not on the stack
  * during XML export. */
 static bool write_bsc(File* f, const AppState* a, const Note* v1, uint16_t c1, const Note* v2, uint16_t c2) {
-    char b[100];
-    bool ok = file_write_text(f, "BSC5\n");
+    char b[128];
+    bool ok = file_write_text(f, "BSC6\n");
     snprintf(b, sizeof(b), "%u %u %d %u %u %u %u\n", a->beats, a->beat_type, (int)a->fifths, (unsigned)a->minor, (unsigned)a->tempo, (unsigned)a->combined, (unsigned)a->separate_staves);
     if(ok) ok = file_write_text(f, b);
     for(uint8_t v = 0; v < 2 && ok; ++v) {
@@ -717,7 +1040,7 @@ static bool write_bsc(File* f, const AppState* a, const Note* v1, uint16_t c1, c
         ok = file_write_text(f, b);
         for(uint16_t i = 0; i < count && ok; ++i) {
             Note n = ns[i];
-            snprintf(b, sizeof(b), "%u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %d %u\n", n.pitch, n.duration, n.rest, n.slur, n.tie, n.accent, n.staccato, n.fermata, n.chord_count, n.chord[0], n.chord[1], n.chord[2], n.dotted, n.repeat_start, n.repeat_end, n.key_change, (int)n.key_fifths, n.key_minor);
+            snprintf(b, sizeof(b), "%u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %d %u %u %u %u %u %u %u\n", n.pitch, n.duration, n.rest, n.slur, n.tie, n.accent, n.staccato, n.fermata, n.chord_count, n.chord[0], n.chord[1], n.chord[2], n.dotted, n.repeat_start, n.repeat_end, n.key_change, (int)n.key_fifths, n.key_minor, n.tenuto, n.staccatissimo, n.marcato, n.ornament, n.aftermark, n.barline);
             ok = file_write_text(f, b);
         }
     }
@@ -799,6 +1122,7 @@ static bool parse_score(File* f, AppState* a, bool commit, ScoreHeader* h) {
                 else if(strcmp(line, "BSC3") == 0) version = 3;
                 else if(strcmp(line, "BSC4") == 0) version = 4;
                 else if(strcmp(line, "BSC5") == 0) version = 5;
+                else if(strcmp(line, "BSC6") == 0) version = 6;
                 else valid = false;
             } else if(version >= 2 && line_no == 1) {
                 unsigned b = 0, d = 0;
@@ -813,12 +1137,13 @@ static bool parse_score(File* f, AppState* a, bool commit, ScoreHeader* h) {
             } else if(line[0]) {
                 unsigned p=0,d=0,r=0,sl=0,t=0,ac=0,st=0,fe=0,cc=0,c0=0,c1=0,c2=0;
                 unsigned dot=0,rs=0,re=0,kc=0,km=0; int kf=0;
-                int matched = version == 5 ? sscanf(line, "%u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %d %u", &p,&d,&r,&sl,&t,&ac,&st,&fe,&cc,&c0,&c1,&c2,&dot,&rs,&re,&kc,&kf,&km) : version == 4 ? sscanf(line, "%u %u %u %u %u %u %u %u %u %u %u %u", &p,&d,&r,&sl,&t,&ac,&st,&fe,&cc,&c0,&c1,&c2) :
+                unsigned tn=0,sg=0,mc=0,orn=0,am=0,bl=0;
+                int matched = version == 6 ? sscanf(line, "%u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %d %u %u %u %u %u %u %u", &p,&d,&r,&sl,&t,&ac,&st,&fe,&cc,&c0,&c1,&c2,&dot,&rs,&re,&kc,&kf,&km,&tn,&sg,&mc,&orn,&am,&bl) : version == 5 ? sscanf(line, "%u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %d %u", &p,&d,&r,&sl,&t,&ac,&st,&fe,&cc,&c0,&c1,&c2,&dot,&rs,&re,&kc,&kf,&km) : version == 4 ? sscanf(line, "%u %u %u %u %u %u %u %u %u %u %u %u", &p,&d,&r,&sl,&t,&ac,&st,&fe,&cc,&c0,&c1,&c2) :
                     version >= 2 ? sscanf(line, "%u %u %u %u %u %u %u %u", &p,&d,&r,&sl,&t,&ac,&st,&fe) : sscanf(line, "%u %u", &p,&d);
-                if(matched != (version == 5 ? 18 : version == 4 ? 12 : version >= 2 ? 8 : 2) || p < 48 || p > 95 || d > 4 || r > 1 || sl > 2 || t > 2 || ac > 1 || st > 1 || fe > 1 || cc > 3 || (cc && (c0 < 48 || c0 > 95)) || (cc > 1 && (c1 < 48 || c1 > 95)) || (cc > 2 && (c2 < 48 || c2 > 95)) || dot > 1 || rs > 1 || re > 1 || kc > 1 || kf < -7 || kf > 7 || km > 1 || h->counts[voice] >= MAX_NOTES) valid = false;
+                if(matched != (version == 6 ? 24 : version == 5 ? 18 : version == 4 ? 12 : version >= 2 ? 8 : 2) || p < 48 || p > 95 || d > 4 || r > 1 || sl > 2 || t > 2 || ac > 1 || st > 1 || fe > 1 || cc > 3 || (cc && (c0 < 48 || c0 > 95)) || (cc > 1 && (c1 < 48 || c1 > 95)) || (cc > 2 && (c2 < 48 || c2 > 95)) || dot > 1 || rs > 1 || re > 1 || kc > 1 || kf < -7 || kf > 7 || km > 1 || tn > 1 || sg > 1 || mc > 1 || orn > 4 || am > 2 || bl > 6 || h->counts[voice] >= MAX_NOTES) valid = false;
                 else {
                     if(commit) {
-                        Note n = {.pitch=p,.duration=d,.rest=r,.slur=sl,.tie=t,.accent=ac,.staccato=st,.fermata=fe,.chord_count=cc,.chord={c0,c1,c2},.dotted=dot,.repeat_start=rs,.repeat_end=re,.key_change=kc,.key_fifths=kf,.key_minor=km};
+                        Note n = {.pitch=p,.duration=d,.rest=r,.slur=sl,.tie=t,.accent=ac,.staccato=st,.fermata=fe,.chord_count=cc,.chord={c0,c1,c2},.dotted=dot,.repeat_start=rs,.repeat_end=re,.key_change=kc,.key_fifths=kf,.key_minor=km,.tenuto=tn,.staccatissimo=sg,.marcato=mc,.ornament=orn,.aftermark=am,.barline=bl};
                         Note* dst = voice ? a->other_notes : a->notes;
                         dst[h->counts[voice]] = n;
                     }
@@ -956,6 +1281,21 @@ static float pitch_hz(uint8_t midi) {
     while(octave < 0) {hz *= 0.5f; octave++;}
     return hz;
 }
+static float note_volume(const Note* n) {return n->marcato ? 0.9f : (n->accent ? 0.8f : 0.5f);}
+
+/* Semitone offset applied at `ms` into a note that carries an ornament.
+ * Approximate: whole-tone neighbours, fixed segment lengths. */
+static int ornament_offset(uint8_t orn, uint32_t ms) {
+    uint32_t seg = ms / 45;
+    switch(orn) {
+    case 1: return ((ms / 60) & 1) ? 2 : 0;
+    case 2: return seg == 1 ? -2 : 0;
+    case 3: return seg == 1 ? 2 : 0;
+    case 4: return seg == 0 ? 2 : (seg == 2 ? -2 : 0);
+    default: return 0;
+    }
+}
+
 static uint32_t voice_total_ticks(const Note* notes, uint16_t count) {
     uint32_t total = 0;
     for(uint16_t i = 0; i < count; ++i) total += note_ticks(notes[i]);
@@ -975,9 +1315,43 @@ static bool voice_at(const Note* notes, uint16_t count, uint32_t tick, Note* fou
 static void playback_stop(AppState* a) {
     if(a->sounding) {furi_hal_speaker_stop(); a->sounding = false;}
     if(a->speaker_owned) {furi_hal_speaker_release(); a->speaker_owned = false;}
-    a->playing = false; a->play_both = false;
+    a->playing = false; a->play_both = false; a->paused = false;
 }
 static bool time_reached(uint32_t now, uint32_t deadline) {return (int32_t)(now - deadline) >= 0;}
+
+/* Pause silences the speaker (it stays acquired) and remembers when it
+ * happened. Resume shifts every deadline by the paused time so the note
+ * picks up where it left off. */
+static void playback_pause(AppState* a) {
+    if(!a->playing || a->paused) return;
+    a->paused = true;
+    a->pause_tick = furi_get_tick();
+    a->resume_sound = a->sounding;
+    if(a->sounding) {furi_hal_speaker_stop(); a->sounding = false;}
+}
+
+static void playback_resume(AppState* a) {
+    if(!a->playing || !a->paused) return;
+    uint32_t now = furi_get_tick();
+    uint32_t paused_for = now - a->pause_tick;
+    a->paused = false;
+    if(a->play_both) {
+        a->both_start += paused_for;
+        a->both_last_sound = now;
+        return;
+    }
+    a->note_end_tick += paused_for;
+    a->sound_end_tick += paused_for;
+    a->note_start_tick += paused_for;
+    a->chord_last = now;
+    if(a->resume_sound && a->play_index < a->play_end) {
+        Note n = a->notes[a->play_index];
+        if(!n.rest) {
+            furi_hal_speaker_start(pitch_hz(n.pitch), note_volume(&n));
+            a->sounding = true;
+        }
+    }
+}
 static void playback_start_note(AppState* a, uint32_t now) {
     if(a->play_index >= a->play_end) {playback_stop(a); return;}
     Note n = a->notes[a->play_index];
@@ -989,17 +1363,19 @@ static void playback_start_note(AppState* a, uint32_t now) {
     if(!n.rest) {
         bool tied_forward = n.tie == 1 && a->play_index + 1 < a->play_end && a->notes[a->play_index + 1].tie == 2 && a->notes[a->play_index + 1].pitch == n.pitch;
         bool tied_back = n.tie == 2 && a->play_index > 0 && a->notes[a->play_index - 1].tie == 1 && a->notes[a->play_index - 1].pitch == n.pitch;
-        uint32_t gap = n.staccato ? ms / 2 : (n.slur || tied_forward || tied_back ? 0 : 35);
+        uint32_t gap = n.staccato ? ms / 2 : (n.staccatissimo ? ms * 3 / 4 : (n.slur || tied_forward || tied_back ? 0 : (n.tenuto ? 5 : 35)));
         if(gap >= ms) gap = ms / 4;
         a->sound_end_tick = now + furi_ms_to_ticks(ms - gap);
         if(!tied_back || !a->sounding) {
             if(a->sounding) {furi_hal_speaker_stop(); a->sounding = false;}
-            furi_hal_speaker_start(pitch_hz(n.pitch), n.accent ? 0.8f : 0.5f);
+            furi_hal_speaker_start(pitch_hz(n.pitch), note_volume(&n));
             a->sounding = true;
         }
         if(tied_forward) a->sound_end_tick = a->note_end_tick;
         a->chord_last = now;
         a->chord_cycle = 0;
+        a->note_start_tick = now;
+        a->orn_off = 0;
     } else if(a->sounding) {furi_hal_speaker_stop(); a->sounding = false;}
     a->selected = a->play_index;
 }
@@ -1072,7 +1448,7 @@ static void playback_advance(AppState* a) {
 }
 
 static void playback_update(AppState* a) {
-    if(!a->playing) return;
+    if(!a->playing || a->paused) return;
     if(a->play_both) {playback_update_both(a); return;}
     uint32_t now = furi_get_tick();
     if(a->sounding && time_reached(now, a->sound_end_tick)) {
@@ -1083,58 +1459,101 @@ static void playback_update(AppState* a) {
     /* The speaker is monophonic, so chords are arpeggiated quickly. */
     if(a->sounding && a->play_index < a->play_end) {
         Note cn = a->notes[a->play_index];
-        if(!cn.rest && cn.chord_count && (now - a->chord_last) >= furi_ms_to_ticks(22)) {
+        if(!cn.rest && cn.ornament) {
+            uint32_t ms_in = (uint32_t)(((uint64_t)(now - a->note_start_tick) * 1000U) / furi_ms_to_ticks(1000));
+            int off = ornament_offset(cn.ornament, ms_in);
+            if(off != a->orn_off) {
+                a->orn_off = (int8_t)off;
+                furi_hal_speaker_stop();
+                furi_hal_speaker_start(pitch_hz((uint8_t)((int)cn.pitch + off)), note_volume(&cn));
+            }
+        } else if(!cn.rest && cn.chord_count && (now - a->chord_last) >= furi_ms_to_ticks(22)) {
             uint8_t pitches[4]; uint8_t pc = 0;
             pitches[pc++] = cn.pitch;
             for(uint8_t k = 0; k < cn.chord_count && k < 3; ++k) pitches[pc++] = cn.chord[k];
             a->chord_last = now;
             a->chord_cycle++;
             furi_hal_speaker_stop();
-            furi_hal_speaker_start(pitch_hz(pitches[a->chord_cycle % pc]), cn.accent ? 0.8f : 0.5f);
+            furi_hal_speaker_start(pitch_hz(pitches[a->chord_cycle % pc]), note_volume(&cn));
         }
     }
     if(time_reached(now, a->note_end_tick)) {playback_advance(a); playback_start_note(a, now);}
 }
 
-static void do_menu(AppState* a) {
+/* Runs one menu entry. Toggles return early (staying in the submenu so the
+ * checkbox updates); everything else falls through to the score screen. */
+static void do_menu(AppState* a, uint8_t entry) {
     Note* n = a->count ? &a->notes[a->selected] : NULL;
     a->notice[0] = '\0';
-    switch(a->menu) {
-    case 0: a->adding_rest = true; a->screen = ScreenDuration; return;
-    case 1: a->screen = ScreenTime; return;
-    case 2: a->screen = ScreenKey; return;
-    case 3: if(n && !n->rest) n->slur = n->slur == 1 ? 0 : 1; break;
-    case 4: if(n && !n->rest) n->slur = n->slur == 2 ? 0 : 2; break;
-    case 5: if(n && !n->rest) n->tie = n->tie == 1 ? 0 : 1; break;
-    case 6: if(n && !n->rest) n->tie = n->tie == 2 ? 0 : 2; break;
-    case 7: if(n && !n->rest) n->staccato ^= 1; break;
-    case 8: if(n && !n->rest) n->accent ^= 1; break;
-    case 9: if(n && !n->rest) n->fermata ^= 1; break;
-    case 10: snprintf(a->notice, sizeof(a->notice), write_score(a, false) ? "Score saved" : "Save failed"); break;
-    case 11: snprintf(a->notice, sizeof(a->notice), load_score(a) ? "Score loaded" : "Load failed"); break;
-    case 12: snprintf(a->notice, sizeof(a->notice), write_score(a, true) ? "MusicXML exported" : "Export failed"); break;
-    case 13:
+    if(entry >= ActCount) {
+        if(n && !n->rest) {mark_toggle(n, entry - ActCount); return;}
+        snprintf(a->notice, sizeof(a->notice), "Select a note first");
+        a->screen = ScreenScore;
+        return;
+    }
+    switch(entry) {
+    case ActAddRest: a->adding_rest = true; a->screen = ScreenDuration; return;
+    case ActTime: a->screen = ScreenTime; return;
+    case ActKey: a->inserting_key = false; a->screen = ScreenKey; return;
+    case ActSlurStart: case ActSlurEnd: case ActTieStart: case ActTieEnd:
+        if(n && !n->rest) {
+            if(entry == ActSlurStart) n->slur = n->slur == 1 ? 0 : 1;
+            else if(entry == ActSlurEnd) n->slur = n->slur == 2 ? 0 : 2;
+            else if(entry == ActTieStart) n->tie = n->tie == 1 ? 0 : 1;
+            else n->tie = n->tie == 2 ? 0 : 2;
+            return;
+        }
+        snprintf(a->notice, sizeof(a->notice), "Select a note first");
+        break;
+    case ActSave: snprintf(a->notice, sizeof(a->notice), write_score(a, false) ? "Score saved" : "Save failed"); break;
+    case ActLoad: snprintf(a->notice, sizeof(a->notice), load_score(a) ? "Score loaded" : "Load failed"); break;
+    case ActExport: snprintf(a->notice, sizeof(a->notice), write_score(a, true) ? "MusicXML exported" : "Export failed"); break;
+    case ActClear:
         a->count = 0; a->selected = 0; a->other_count = 0; a->other_selected = 0;
         a->undo_valid = false;
         snprintf(a->notice, sizeof(a->notice), "Both voices cleared");
         break;
-    case 14: playback_begin(a, 0, false); break;
-    case 15: playback_begin(a, a->selected, false); break;
-    case 16: playback_begin(a, a->selected, true); break;
-    case 17: a->screen = ScreenTempo; return;
-    case 18: switch_voice(a); snprintf(a->notice, sizeof(a->notice), "Voice %u", (unsigned)a->voice + 1); break;
-    case 19: a->combined = !a->combined; snprintf(a->notice, sizeof(a->notice), a->combined ? "Combined view" : "Solo view"); break;
-    case 20: if(n && !n->rest) {a->chord_pitch = n->pitch < 83 ? n->pitch + 12 : n->pitch - 12; a->chord_edit = true; a->screen = ScreenPitch; return;} else snprintf(a->notice, sizeof(a->notice), "Select a note first"); break;
-    case 21: if(n && n->chord_count) {n->chord_count--; snprintf(a->notice, sizeof(a->notice), "Chord tone removed");} else snprintf(a->notice, sizeof(a->notice), "No chord tones"); break;
-    case 22: a->separate_staves = !a->separate_staves; snprintf(a->notice, sizeof(a->notice), a->separate_staves ? "XML: 2 staves" : "XML: 1 staff"); break;
-    case 23: playback_begin_both(a); break;
-    case 24: a->about_page = 0; a->screen = ScreenAbout; return;
-    case 25: if(n) {n->dotted ^= 1; snprintf(a->notice,sizeof(a->notice),n->dotted ? "Dotted" : "Undotted");} break;
-    case 26: if(n) {n->repeat_start ^= 1; snprintf(a->notice,sizeof(a->notice),"Repeat start toggled");} break;
-    case 27: if(n) {n->repeat_end ^= 1; snprintf(a->notice,sizeof(a->notice),"Repeat end toggled");} break;
-    case 28: if(n) {a->inserting_key=true; active_key(a, a->notes, a->count, a->selected, &a->edit_fifths, &a->edit_minor); a->screen=ScreenKey; return;} break;
-    case 29: if(n) {n->key_change=0; snprintf(a->notice,sizeof(a->notice),"Key change removed");} break;
-    case 30: undo_delete(a); break;
+    case ActPlay: playback_begin(a, 0, false); break;
+    case ActPlayFrom: playback_begin(a, a->selected, false); break;
+    case ActPreview: playback_begin(a, a->selected, true); break;
+    case ActTempo: a->screen = ScreenTempo; return;
+    case ActVoice: switch_voice(a); snprintf(a->notice, sizeof(a->notice), "Voice %u", (unsigned)a->voice + 1); break;
+    case ActCombined: a->combined = !a->combined; return;
+    case ActChordAdd:
+        if(n && !n->rest) {
+            a->chord_pitch = n->pitch < 83 ? n->pitch + 12 : n->pitch - 12;
+            a->chord_edit = true; a->screen = ScreenPitch; return;
+        }
+        snprintf(a->notice, sizeof(a->notice), "Select a note first");
+        break;
+    case ActChordRemove:
+        if(n && n->chord_count) {n->chord_count--; snprintf(a->notice, sizeof(a->notice), "Chord tone removed");}
+        else snprintf(a->notice, sizeof(a->notice), "No chord tones");
+        break;
+    case ActXmlLayout: a->separate_staves = !a->separate_staves; return;
+    case ActPlayBoth: playback_begin_both(a); break;
+    case ActHelp: a->about_page = 0; a->screen = ScreenAbout; return;
+    case ActDotted: if(n) {n->dotted ^= 1; return;} snprintf(a->notice, sizeof(a->notice), "No notes yet"); break;
+    case ActRepeatStart: if(n) {n->repeat_start ^= 1; return;} snprintf(a->notice, sizeof(a->notice), "No notes yet"); break;
+    case ActRepeatEnd: if(n) {n->repeat_end ^= 1; return;} snprintf(a->notice, sizeof(a->notice), "No notes yet"); break;
+    case ActKeyChange:
+        if(n) {
+            a->inserting_key = true;
+            active_key(a, a->notes, a->count, a->selected, &a->edit_fifths, &a->edit_minor);
+            a->screen = ScreenKey; return;
+        }
+        snprintf(a->notice, sizeof(a->notice), "No notes yet");
+        break;
+    case ActKeyRemove: if(n) {n->key_change = 0; snprintf(a->notice, sizeof(a->notice), "Key change removed");} break;
+    case ActUndo: undo_delete(a); break;
+    case ActBarline:
+        if(n) {
+            a->barline_choice = a->notes[measure_last_index(a, a->selected)].barline;
+            a->screen = ScreenBarline; return;
+        }
+        snprintf(a->notice, sizeof(a->notice), "No notes yet");
+        break;
+    default: break;
     }
     a->screen = ScreenScore;
 }
@@ -1163,7 +1582,7 @@ int32_t bards_score_app(void* p) {
     view_port_update(a->viewport);
     InputEvent ev;
     while(a->running) {
-        FuriStatus status = furi_message_queue_get(a->queue, &ev, a->playing ? furi_ms_to_ticks(10) : FuriWaitForever);
+        FuriStatus status = furi_message_queue_get(a->queue, &ev, (a->playing && !a->paused) ? furi_ms_to_ticks(10) : FuriWaitForever);
         furi_mutex_acquire(a->mutex, FuriWaitForever);
         if(status != FuriStatusOk) {
             playback_update(a);
@@ -1171,7 +1590,11 @@ int32_t bards_score_app(void* p) {
         }
         a->notice[0] = '\0';
         if(a->playing) {
-            if(ev.key == InputKeyBack && ev.type == InputTypeShort) {playback_stop(a); snprintf(a->notice, sizeof(a->notice), "Playback stopped");}
+            if(ev.key == InputKeyBack && ev.type == InputTypeLong) {playback_stop(a); a->running = false;}
+            else if(ev.key == InputKeyBack && ev.type == InputTypeShort) {playback_stop(a); snprintf(a->notice, sizeof(a->notice), "Playback stopped");}
+            else if(ev.key == InputKeyOk && ev.type == InputTypeShort) {
+                if(a->paused) playback_resume(a); else playback_pause(a);
+            }
             furi_mutex_release(a->mutex); view_port_update(a->viewport); continue;
         }
         /* "nav" accepts auto-repeat for the arrow keys only, so holding
@@ -1234,17 +1657,39 @@ int32_t bards_score_app(void* p) {
                 else if(ev.key == InputKeyDown) a->about_page = a->about_page == 8 ? 0 : a->about_page + 1;
                 else if(ev.key == InputKeyOk) a->about_page = (a->about_page + 1) % 9;
             }
+        } else if(a->screen == ScreenBarline) {
+            if(ev.key == InputKeyBack && ev.type == InputTypeShort) a->screen = ScreenScore;
+            else if(nav) {
+                if(ev.key == InputKeyUp) a->barline_choice = a->barline_choice == 0 ? BARLINE_COUNT - 1 : a->barline_choice - 1;
+                else if(ev.key == InputKeyDown) a->barline_choice = a->barline_choice + 1 >= BARLINE_COUNT ? 0 : a->barline_choice + 1;
+                else if(ev.key == InputKeyOk && a->count) {
+                    a->notes[measure_last_index(a, a->selected)].barline = a->barline_choice;
+                    snprintf(a->notice, sizeof(a->notice), "Barline set");
+                    a->screen = ScreenScore;
+                }
+            }
         } else if(a->screen == ScreenMenu) {
             if(ev.key == InputKeyBack && ev.type == InputTypeShort) a->screen = ScreenScore;
             else if(nav) {
-                if(ev.key == InputKeyUp) {
-                    a->menu = a->menu == 0 ? MENU_COUNT - 1 : a->menu - 1;
-                } else if(ev.key == InputKeyDown) {
-                    a->menu = a->menu + 1 >= MENU_COUNT ? 0 : a->menu + 1;
+                if(ev.key == InputKeyUp) a->menu = a->menu == 0 ? MENU_CAT_COUNT - 1 : a->menu - 1;
+                else if(ev.key == InputKeyDown) a->menu = a->menu + 1 >= MENU_CAT_COUNT ? 0 : a->menu + 1;
+                else if(ev.key == InputKeyOk) {
+                    const MenuCat* cat = &menu_cats[a->menu];
+                    if(cat->count == 1) do_menu(a, cat->items[0]);
+                    else {a->menu_cat = a->menu; a->sub = 0; a->sub_top = 0; a->screen = ScreenSubmenu;}
                 }
-                else if(ev.key == InputKeyOk) do_menu(a);
                 if(a->menu < a->menu_top) a->menu_top = a->menu;
                 if(a->menu >= a->menu_top + 4) a->menu_top = a->menu - 3;
+            }
+        } else if(a->screen == ScreenSubmenu) {
+            const MenuCat* cat = &menu_cats[a->menu_cat];
+            if(ev.key == InputKeyBack && ev.type == InputTypeShort) a->screen = ScreenMenu;
+            else if(nav) {
+                if(ev.key == InputKeyUp) a->sub = a->sub == 0 ? cat->count - 1 : a->sub - 1;
+                else if(ev.key == InputKeyDown) a->sub = a->sub + 1 >= cat->count ? 0 : a->sub + 1;
+                else if(ev.key == InputKeyOk) do_menu(a, cat->items[a->sub]);
+                if(a->sub < a->sub_top) a->sub_top = a->sub;
+                if(a->sub >= a->sub_top + 4) a->sub_top = a->sub - 3;
             }
         }
         furi_mutex_release(a->mutex);
